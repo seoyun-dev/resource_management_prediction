@@ -1,16 +1,44 @@
 <!DOCTYPE html>
 <html lang="ko">
+<!--
+  운영 대시보드 — serving_app/static/index.html (단일 파일 · 외부 의존 없음 · CDN/웹폰트 없음)
+
+  하는 일
+    전기아연도금 설비의 「다음 15분 Power_Usage」 예측 서빙을 한 화면에서 본다. 탭 4개.
+      Dashboard  : 운영 지표 요약(/metrics/summary) · 재학습 파이프라인 7단계 · 재학습 이력(/registry/versions)
+                   · 현재 운영 모델(/registry/champion + /health) · 최근 알람(/logs/alerts)
+      Simulation : 시나리오(/simulate/scenarios) → POST /simulate/{scenario} → 실제 vs 예측 선 그래프(인라인 SVG)
+                   · 21건 이동 RMSE vs 임계값(/config) · drift_check 판정 · /retrain/status 2초 폴링
+      Datasets   : CSV 업로드(/data/upload) · 정제 요약(/data/status) · 품질 6지수 표 + 가중 합계
+      System     : /health · /config · 엔드포인트 목록(Swagger /docs 링크)
+
+  왜
+    스켈레톤(HAIC) 화면은 업로드·배치 전송·로그 파일 열람뿐이라, 「드리프트 → 백그라운드 재학습 → champion 승격」
+    루프가 실제로 돌았는지를 눈으로 확인하기 어려웠다. 교수 데모(4탭) 구성을 따르되 우리 API(docs/SPEC.md §4)만 쓴다.
+    대시보드 자신의 조회 요청도 requests.log 에 집계되므로 자동 새로고침은 30초 간격으로만 한다.
+    서버가 꺼져 있거나 API 하나가 실패해도 카드마다 한국어 오류 문구를 띄운다(빈 화면 금지).
+
+  확인 방법
+    uvicorn serving_app.main:app --port 8000  →  http://localhost:8000/#simulation
+    → 「설비 이상」 클릭 → 드리프트 감지 → 파이프라인 5~7단계가 2초마다 바뀜 → Dashboard 재학습 이력에 새 champion 강조.
+    탭은 URL 해시로 바로 열린다: /#dashboard  /#simulation  /#datasets  /#system  (헤드리스 캡처·발표 링크용)
+    서버 없이 file:// 로 열면 모든 카드가 「불러오지 못했습니다」 문구를 보여야 정상이다.
+-->
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>AIOps · HAIC 재학습 파이프라인</title>
+<title>AIOps · 표면처리 에너지 예측</title>
 <link rel="icon" type="image/x-icon" href="/favicon.ico" />
 <style>
+  /* 스켈레톤의 다크 테마 토큰을 그대로 쓰고, 차트 계열색만 더했다.
+     계열색 3개(실제·예측·이동 RMSE)는 #12151c 패널 위에서 색각 이상 분리도까지 검증한 값이다. */
   :root {
     --bg: #0a0c10;
     --panel: #12151c;
     --panel-2: #171b25;
+    --panel-3: #1d2230;
     --border: #262b38;
+    --grid: #202533;
     --text: #eef1f7;
     --muted: #9aa4b8;
     --faint: #5b6478;
@@ -22,384 +50,1993 @@
     --warn-soft: rgba(245, 182, 76, 0.14);
     --err: #ff6b6b;
     --err-soft: rgba(255, 107, 107, 0.14);
+    --series-actual: #3987e5;
+    --series-pred: #d95926;
+    --series-rmse: #9085e9;
     --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Pretendard, sans-serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Malgun Gothic", Pretendard, sans-serif;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); }
+  html { color-scheme: dark; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; }
+  a { color: var(--accent); }
+  [hidden] { display: none !important; }
 
+  /* ---------- 상단 바 ---------- */
   .topnav {
-    display: flex; align-items: center; gap: 14px; justify-content: space-between;
+    display: flex; align-items: center; gap: 18px; justify-content: space-between; flex-wrap: wrap;
     background: var(--panel); border-bottom: 1px solid var(--border);
-    padding: 0 20px; height: 60px; position: sticky; top: 0; z-index: 10;
+    padding: 0 22px; min-height: 62px; position: sticky; top: 0; z-index: 20;
   }
-  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 10px 0; }
   .brand-mark {
     width: 34px; height: 34px; border-radius: 9px;
     background: linear-gradient(135deg, var(--accent), #a9bdff);
-    display: flex; align-items: center; justify-content: center; color: #0a0c10;
-    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; color: #0a0c10; flex-shrink: 0;
   }
-  .brand-text .title { font-weight: 700; font-size: 1.02rem; line-height: 1.2; }
-  .brand-text .subtitle { font-size: 0.72rem; color: var(--muted); }
-  .nav-right { display: flex; align-items: center; gap: 10px; font-size: 0.8rem; color: var(--muted); }
+  .brand-text .title { font-weight: 700; font-size: 1.02rem; line-height: 1.2; white-space: nowrap; }
+  .brand-text .subtitle { font-size: 0.72rem; color: var(--muted); white-space: nowrap; }
+  .tabs { display: flex; gap: 2px; align-self: stretch; }
+  .tab {
+    display: flex; align-items: center; padding: 0 14px; color: var(--muted); text-decoration: none;
+    font-weight: 700; font-size: 0.86rem; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tab:hover { color: var(--text); }
+  .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+  .nav-right { display: flex; align-items: center; gap: 10px; font-size: 0.8rem; color: var(--muted); white-space: nowrap; padding: 10px 0; }
+  .clock { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); }
+  /* 1280px 아래에서는 탭을 둘째 줄로 내려 헤더가 겹치지 않게 한다 */
+  @media (max-width: 1279px) {
+    .tabs { order: 3; width: 100%; border-top: 1px solid var(--border); }
+    .tab { padding: 10px 14px; }
+  }
+
   .pill {
     display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px;
-    font-size: 0.74rem; font-weight: 700;
+    font-size: 0.74rem; font-weight: 700; white-space: nowrap;
   }
   .pill.ok { background: var(--ok-soft); color: var(--ok); }
   .pill.warn { background: var(--warn-soft); color: var(--warn); }
   .pill.err { background: var(--err-soft); color: var(--err); }
+  .pill.run { background: var(--accent-soft); color: var(--accent); }
   .pill.neutral { background: var(--panel-2); color: var(--muted); }
-  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+  .pill.run .dot, .pipe-stage.run .pipe-num { animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
 
-  .page { max-width: 980px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
-
-  .card {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
-    padding: 18px 20px;
+  .banner {
+    background: var(--warn-soft); color: var(--warn); border-bottom: 1px solid var(--border);
+    padding: 9px 22px; font-size: 0.82rem;
   }
-  .section-head { margin-bottom: 14px; }
-  .section-head h2 { margin: 0 0 3px; font-size: 1.05rem; }
-  .section-head p { margin: 0; color: var(--muted); font-size: 0.82rem; line-height: 1.5; }
-  .section-head-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 
-  .btn { border: none; border-radius: 9px; padding: 9px 14px; font-size: 0.83rem; font-weight: 700; cursor: pointer; }
+  /* ---------- 레이아웃 ---------- */
+  .page { max-width: 1320px; margin: 0 auto; padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; }
+  .grid-2 { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+  .grid-even { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+  .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  @media (max-width: 1099px) {
+    .grid-2, .grid-even { grid-template-columns: minmax(0, 1fr); }
+  }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; min-width: 0; }
+  .section-head { margin-bottom: 14px; }
+  .section-head h2 { margin: 0 0 3px; font-size: 1.02rem; }
+  .section-head p { margin: 0; color: var(--muted); font-size: 0.8rem; line-height: 1.55; }
+  .section-head-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .section-head-row .section-head { margin-bottom: 0; }
+  .head-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .updated { font-size: 0.72rem; color: var(--faint); font-family: var(--mono); }
+
+  .btn { border: none; border-radius: 9px; padding: 8px 14px; font-size: 0.82rem; font-weight: 700; cursor: pointer; font-family: inherit; }
   .btn.primary { background: var(--accent); color: #0a0c10; }
   .btn.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
-  .btn.danger { background: var(--err); color: #1a0a0a; }
+  .btn.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); padding: 5px 10px; font-size: 0.76rem; }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
 
-  /* ---------- Upload ---------- */
-  .upload-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  input[type="file"] {
-    color: var(--muted); font-size: 0.82rem; max-width: 100%;
+  .seg { display: inline-flex; background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px; padding: 2px; }
+  .seg button {
+    background: transparent; border: none; color: var(--muted); font-weight: 700; font-size: 0.78rem;
+    padding: 5px 12px; border-radius: 7px; cursor: pointer; font-family: inherit;
   }
+  .seg button.on { background: var(--accent-soft); color: var(--text); }
 
-  /* ---------- Pipeline ---------- */
-  .pipeline-meta { display: flex; align-items: center; gap: 10px; font-size: 0.8rem; color: var(--muted); }
-  .pipeline-track { display: flex; align-items: stretch; overflow-x: auto; padding: 2px 2px 4px; gap: 0; }
-  .pipe-stage { flex: 1; min-width: 110px; text-align: center; padding: 10px 10px; border-left: 1px solid var(--border); }
-  .pipe-stage:first-child { border-left: none; }
-  .pipe-title { font-size: 0.82rem; font-weight: 700; color: var(--faint); }
-  .pipe-stage.ok .pipe-title, .pipe-stage.warn .pipe-title { color: var(--text); }
-  .pipe-desc { font-size: 0.7rem; color: var(--muted); margin: 2px 0 6px; line-height: 1.4; }
-  .pipe-status { font-size: 0.7rem; font-weight: 700; }
+  /* ---------- 오류·빈 상태 ---------- */
+  .err-box {
+    display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: 10px;
+    background: var(--err-soft); border: 1px solid rgba(255, 107, 107, 0.35); color: var(--text);
+  }
+  .err-box svg { color: var(--err); flex-shrink: 0; margin-top: 1px; }
+  .err-title { font-weight: 700; font-size: 0.84rem; }
+  .err-msg { font-size: 0.8rem; color: var(--muted); margin-top: 3px; line-height: 1.5; word-break: break-word; }
+  .empty { color: var(--muted); font-size: 0.82rem; padding: 18px 4px; text-align: center; line-height: 1.6; }
+  .loading { color: var(--faint); font-size: 0.82rem; padding: 14px 2px; }
+  .note { font-size: 0.76rem; color: var(--muted); line-height: 1.55; margin-top: 10px; }
+  .note.warn { color: var(--warn); }
+  .note svg { vertical-align: -2px; }
+  .refreshing { opacity: 0.55; transition: opacity 0.15s; }
+
+  /* ---------- 지표 타일 ---------- */
+  .metrics-wrap { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+  .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+  .tile { background: var(--panel-2); border: 1px solid var(--border); border-radius: 11px; padding: 12px 14px; min-width: 0; }
+  .tile-label { font-size: 0.72rem; color: var(--muted); font-weight: 600; }
+  .tile-value { font-size: 1.55rem; font-weight: 800; margin-top: 4px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+  .tile-value small { font-size: 0.8rem; font-weight: 600; color: var(--muted); margin-left: 3px; }
+  .tile-sub { font-size: 0.72rem; color: var(--faint); margin-top: 5px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+
+  /* ---------- 파이프라인 ---------- */
+  .pipeline-track { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; }
+  .pipe-stage {
+    position: relative; background: var(--panel-2); border: 1px solid var(--border); border-radius: 11px;
+    padding: 12px 8px 11px; text-align: center; border-top: 3px solid var(--border); min-width: 0;
+  }
+  .pipe-stage:not(:last-child)::after {
+    content: ""; position: absolute; right: -7px; top: 50%; width: 6px; height: 6px; transform: translateY(-50%) rotate(45deg);
+    border-top: 2px solid var(--faint); border-right: 2px solid var(--faint);
+  }
+  .pipe-num {
+    width: 22px; height: 22px; border-radius: 50%; margin: 0 auto 6px; display: flex; align-items: center; justify-content: center;
+    font-size: 0.72rem; font-weight: 800; background: var(--panel-3); color: var(--faint);
+  }
+  .pipe-title { font-size: 0.8rem; font-weight: 700; color: var(--faint); }
+  .pipe-desc { font-size: 0.68rem; color: var(--muted); margin: 2px 0 7px; line-height: 1.4; min-height: 1.9em; }
+  .pipe-status { font-size: 0.7rem; font-weight: 700; color: var(--faint); line-height: 1.35; word-break: keep-all; }
+  .pipe-stage.ok { border-top-color: var(--ok); }
+  .pipe-stage.ok .pipe-num { background: var(--ok-soft); color: var(--ok); }
   .pipe-stage.ok .pipe-status { color: var(--ok); }
+  .pipe-stage.warn { border-top-color: var(--warn); }
+  .pipe-stage.warn .pipe-num { background: var(--warn-soft); color: var(--warn); }
   .pipe-stage.warn .pipe-status { color: var(--warn); }
-  .pipe-stage.idle .pipe-status { color: var(--faint); }
+  .pipe-stage.run { border-top-color: var(--accent); }
+  .pipe-stage.run .pipe-num { background: var(--accent-soft); color: var(--accent); }
+  .pipe-stage.run .pipe-status { color: var(--accent); }
+  .pipe-stage.err { border-top-color: var(--err); }
+  .pipe-stage.err .pipe-num { background: var(--err-soft); color: var(--err); }
+  .pipe-stage.err .pipe-status { color: var(--err); }
+  .pipe-stage.ok .pipe-title, .pipe-stage.warn .pipe-title, .pipe-stage.run .pipe-title, .pipe-stage.err .pipe-title { color: var(--text); }
 
-  /* ---------- Tables ---------- */
-  table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
-  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 0.74rem; text-transform: uppercase;
-       letter-spacing: 0.03em; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-  td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
+  /* ---------- 표 ---------- */
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 0.72rem; letter-spacing: 0.02em;
+       padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
   tr:last-child td { border-bottom: none; }
-  .table-empty { color: var(--faint); font-size: 0.82rem; padding: 20px 4px; text-align: center; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.mono { font-family: var(--mono); font-size: 0.76rem; color: var(--muted); }
+  tr.champion td { background: var(--accent-soft); }
+  tr.champion td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+  tr.total td { font-weight: 800; border-top: 1px solid var(--border); }
+  .table-scroll { max-height: 340px; overflow-y: auto; }
+  .kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 16px; font-size: 0.82rem; margin: 0; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-variant-numeric: tabular-nums; word-break: break-word; }
+  .kv dd.mono { font-family: var(--mono); font-size: 0.78rem; }
+
+  /* ---------- 운영 모델 카드 ---------- */
+  .champ-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .champ-name { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); }
+  .champ-ver { font-size: 2rem; font-weight: 800; letter-spacing: -0.02em; line-height: 1.1; }
+  .champ-block + .champ-block, .kv + .champ-block { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .block-label { font-size: 0.72rem; font-weight: 700; color: var(--faint); margin-bottom: 8px; letter-spacing: 0.02em; }
+
+  /* ---------- 알람 ---------- */
+  .alerts { list-style: none; margin: 0; padding: 0; max-height: 380px; overflow-y: auto; }
+  .alert { display: grid; grid-template-columns: 20px 50px minmax(0, 1fr); gap: 8px; align-items: start; padding: 8px 2px; border-bottom: 1px solid var(--border); }
+  .alert:last-child { border-bottom: none; }
+  .alert svg { margin-top: 1px; display: block; }
+  .alert .lv { font-size: 0.7rem; font-weight: 800; margin-top: 2px; }
+  .alert .msg { font-family: var(--mono); font-size: 0.76rem; line-height: 1.5; word-break: break-word; }
+  .alert .ts { font-size: 0.7rem; color: var(--faint); margin-top: 2px; font-family: var(--mono); }
+  .lv-warn { color: var(--warn); } .lv-info { color: var(--accent); } .lv-ok { color: var(--ok); }
+  .lv-fail { color: var(--err); } .lv-error { color: var(--err); } .lv-other { color: var(--muted); }
+
+  /* ---------- 시뮬레이션 ---------- */
+  .sim-controls { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; font-size: 0.8rem; color: var(--muted); }
+  .sim-controls label { display: inline-flex; align-items: center; gap: 6px; }
+  input[type="number"] {
+    width: 82px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 6px 8px; font-family: var(--mono); font-size: 0.8rem;
+  }
+  .scenarios { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+  .scn {
+    text-align: left; background: var(--panel-2); border: 1px solid var(--border); border-radius: 11px; padding: 12px 14px;
+    color: var(--text); cursor: pointer; font-family: inherit; display: flex; flex-direction: column; gap: 5px; min-width: 0;
+  }
+  .scn:hover:not(:disabled) { border-color: var(--accent); }
+  .scn:disabled { opacity: 0.5; cursor: wait; }
+  .scn.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .scn-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .scn-title { font-weight: 800; font-size: 0.9rem; }
+  .scn-code { font-family: var(--mono); font-size: 0.68rem; color: var(--faint); }
+  .scn-desc { font-size: 0.74rem; color: var(--muted); line-height: 1.5; }
+  .scn-kind { font-size: 0.66rem; font-weight: 800; white-space: nowrap; }
+  .scn-kind.base { color: var(--ok); } .scn-kind.drift { color: var(--warn); }
+  @media (max-width: 1239px) { .scenarios { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+  .sim-status { margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 0.82rem; color: var(--muted); min-height: 22px; }
+  .legend { display: flex; gap: 16px; font-size: 0.76rem; color: var(--muted); align-items: center; flex-wrap: wrap; }
+  .legend .key { display: inline-flex; align-items: center; gap: 6px; }
+  .legend svg { display: block; }
+  .chart-host { position: relative; width: 100%; }
+  .chart-host svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .chart-host text { fill: var(--muted); font-size: 11px; font-family: var(--sans); }
+  .chart-host .gridline { stroke: var(--grid); stroke-width: 1; }
+  .chart-host .axis { stroke: var(--border); stroke-width: 1; }
+  .chart-host .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .chart-host .ln-actual { stroke: var(--series-actual); }
+  .chart-host .ln-pred { stroke: var(--series-pred); stroke-dasharray: 5 3; }
+  .chart-host .ln-rmse { stroke: var(--series-rmse); }
+  .chart-host .shade { fill: var(--accent-soft); opacity: 0.45; }
+  .chart-host .shade-label { fill: var(--muted); font-size: 10.5px; }
+  .chart-host .thr { stroke: var(--err); stroke-width: 1.5; stroke-dasharray: 6 4; }
+  .chart-host .thr-label { fill: var(--err); font-weight: 700; }
+  .chart-host .xhair { stroke: var(--muted); stroke-width: 1; }
+  .chart-host .xdot { stroke: var(--panel); stroke-width: 2; }
+  .chart-host .hit { fill: transparent; cursor: crosshair; outline: none; }
+  .chart-host .hit:focus-visible { stroke: var(--accent); stroke-width: 1; }
+  .tip {
+    position: absolute; pointer-events: none; background: var(--panel-3); border: 1px solid var(--border);
+    border-radius: 9px; padding: 8px 10px; font-size: 0.76rem; min-width: 150px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+    display: none; z-index: 5;
+  }
+  .tip .t-head { color: var(--muted); font-size: 0.72rem; margin-bottom: 5px; font-family: var(--mono); }
+  .tip .t-row { display: grid; grid-template-columns: 16px auto 1fr; gap: 6px; align-items: center; }
+  .tip .t-row b { font-variant-numeric: tabular-nums; font-size: 0.84rem; }
+  .tip .t-row span { color: var(--muted); }
+  .tip .t-foot { color: var(--muted); margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--border); }
+  .chart-title { font-size: 0.8rem; font-weight: 700; margin: 16px 0 4px; display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .chart-title span { font-weight: 500; color: var(--muted); font-size: 0.74rem; }
+  details.tbl { margin-top: 12px; }
+  details.tbl summary { cursor: pointer; color: var(--muted); font-size: 0.78rem; }
+  details.tbl .table-scroll { margin-top: 8px; max-height: 260px; }
+
+  .readout { display: flex; flex-direction: column; gap: 12px; }
+  .readout-main { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; }
+  .big { font-size: 2.3rem; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; margin-top: 4px; }
+  .meter { position: relative; height: 10px; background: var(--panel-3); border-radius: 999px; margin: 20px 0 6px; }
+  .meter-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; }
+  .meter-fill.ok { background: var(--ok); } .meter-fill.over { background: var(--err); }
+  .meter-mark { position: absolute; top: -6px; bottom: -6px; width: 2px; background: var(--text); }
+  .meter-mark span { position: absolute; top: -17px; left: 50%; transform: translateX(-50%); font-size: 0.68rem; color: var(--muted); white-space: nowrap; }
+  .mini { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .mini .tile { padding: 9px 11px; }
+  .mini .tile-value { font-size: 1.05rem; }
+
+  .bars { display: flex; flex-direction: column; gap: 7px; margin-top: 4px; }
+  .bar-row { display: grid; grid-template-columns: 112px minmax(0, 1fr) 54px; gap: 8px; align-items: center; font-size: 0.76rem; }
+  .bar-row .name { color: var(--muted); }
+  .bar-row .track { height: 9px; background: var(--panel-3); border-radius: 0 4px 4px 0; }
+  .bar-row .fill { height: 100%; border-radius: 0 4px 4px 0; background: var(--muted); }
+  .bar-row .fill.challenger { background: var(--accent); }
+  .bar-row .val { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; }
+
+  /* ---------- Datasets ---------- */
+  .upload-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  input[type="file"] { color: var(--muted); font-size: 0.82rem; max-width: 100%; }
+  .qbar { height: 8px; background: var(--panel-3); border-radius: 0 4px 4px 0; min-width: 80px; }
+  .qbar div { height: 100%; background: var(--series-actual); border-radius: 0 4px 4px 0; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font-family: var(--mono); font-size: 0.72rem; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; }
+  ul.issues { margin: 8px 0 0; padding-left: 18px; font-size: 0.8rem; color: var(--muted); line-height: 1.6; }
+
+  /* ---------- System ---------- */
+  .method { font-family: var(--mono); font-size: 0.7rem; font-weight: 800; padding: 2px 7px; border-radius: 5px; }
+  .method.GET { background: var(--ok-soft); color: var(--ok); }
+  .method.POST { background: var(--accent-soft); color: var(--accent); }
+  td.path { font-family: var(--mono); font-size: 0.78rem; }
+  td.path a { color: var(--text); }
 
   .result-box {
-    margin-top: 12px; padding: 12px 14px; border-radius: 10px; background: var(--panel-2);
-    border: 1px solid var(--border); font-family: var(--mono); font-size: 0.8rem;
-    white-space: pre-wrap; word-break: break-word; display: none; max-height: 260px; overflow-y: auto;
+    margin-top: 8px; padding: 10px 12px; border-radius: 10px; background: var(--panel-2);
+    border: 1px solid var(--border); font-family: var(--mono); font-size: 0.74rem;
+    white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow-y: auto; color: var(--muted);
   }
-  .result-box.show { display: block; }
-
-  code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
-  footer { color: var(--faint); font-size: 0.76rem; text-align: center; margin: 26px 0 10px; }
+  details.raw summary { cursor: pointer; color: var(--faint); font-size: 0.74rem; margin-top: 10px; }
+  code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+  footer { color: var(--faint); font-size: 0.74rem; text-align: center; margin: 20px 0 16px; }
 </style>
 </head>
 <body>
 
-<div class="topnav">
+<header class="topnav">
   <div class="brand">
-    <div class="brand-mark">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M2 12h4l2-7 4 14 3-10 2 3h5" stroke="#0a0c10" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <div class="brand-mark" aria-hidden="true">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" stroke="#0a0c10" stroke-width="2" stroke-linejoin="round"/></svg>
     </div>
     <div class="brand-text">
-      <div class="title">AIOps · HAIC</div>
-      <div class="subtitle">드리프트 감지 기반 재학습 파이프라인</div>
+      <div class="title">AIOps · 표면처리 에너지 예측</div>
+      <div class="subtitle">전기아연도금 · 다음 15분 Power_Usage 예측</div>
     </div>
   </div>
+  <nav class="tabs" role="tablist" aria-label="화면 전환">
+    <a class="tab" role="tab" href="#dashboard" data-tab="dashboard">Dashboard</a>
+    <a class="tab" role="tab" href="#simulation" data-tab="simulation">Simulation</a>
+    <a class="tab" role="tab" href="#datasets" data-tab="datasets">Datasets</a>
+    <a class="tab" role="tab" href="#system" data-tab="system">System</a>
+  </nav>
   <div class="nav-right">
-    <span class="pill neutral">MODEL_SOURCE=mlflow 기준</span>
+    <span class="clock" id="clock">--</span>
+    <span class="pill neutral" id="model-badge"><span class="dot"></span>MODEL_SOURCE 확인 중…</span>
   </div>
+</header>
+<div class="banner" id="file-banner" hidden>
+  이 화면은 파일(file://)로 열려 있어 API 를 부를 수 없습니다. 서버를 띄운 뒤
+  <code>http://localhost:8000/</code> 으로 여세요. 아래 카드의 오류 문구는 그래서 나온 것입니다.
 </div>
 
-<div class="page">
+<main class="page">
 
-  <!-- ================= 데이터 업로드 ================= -->
-  <div class="card">
-    <div class="section-head">
-      <h2>HAIC 데이터 업로드</h2>
-      <p>
-        <code>data/uploads/</code>는 여기서 업로드한 CSV만 쌓이는 곳입니다. 학습(<code>train_and_register.py</code> 등)은
-        항상 가장 최근에 올라온 파일을 사용합니다. <code>data/sample_haic_prices.csv</code>를 예시로 올려보세요
-        (컬럼: Date, Close, Volume · 최소 41행).
-      </p>
-    </div>
-    <div class="upload-row">
-      <input type="file" id="upload-input" accept=".csv" />
-      <button class="btn primary" onclick="uploadFile()">업로드</button>
-    </div>
-    <div id="upload-status" style="margin-top:10px;"></div>
-  </div>
-
-  <!-- ================= 드리프트 시뮬레이션 ================= -->
-  <div class="card">
-    <div class="section-head">
-      <h2>드리프트 시뮬레이션</h2>
-      <p>
-        일별 수익률(log return) 기반 랜덤워크로 정상/드리프트 배치를 만들어 <code>/predict/batch-test</code>로 전송합니다.
-        드리프트 배치를 보내면 아래 파이프라인이 감지 → 재학습 → (게이트 통과 시) 재배포까지 진행됩니다.
-      </p>
-    </div>
-    <div class="btn-row">
-      <button class="btn primary" onclick="sendBatch('normal')">정상 배치 전송</button>
-      <button class="btn danger" onclick="sendBatch('drift')">드리프트 배치 전송</button>
-    </div>
-    <div id="drift-status" style="margin-top:14px;"></div>
-    <div id="drift-result" class="result-box"></div>
-  </div>
-
-  <!-- ================= 파이프라인 ================= -->
-  <div class="card">
-    <div class="section-head-row">
-      <div class="section-head">
-        <h2>드리프트 감지 기반 재학습 파이프라인</h2>
-        <p>위에서 배치를 보내면, 그 요청이 실제로 거쳐간 단계를 아래에 표시합니다 (자동 스케줄러는 없고, 수동 트리거 방식입니다).</p>
+  <!-- =========================== Dashboard =========================== -->
+  <section id="tab-dashboard" data-panel="dashboard" hidden>
+    <div class="col">
+      <div class="card">
+        <div class="section-head-row">
+          <div class="section-head">
+            <h2>운영 지표 요약</h2>
+            <p><code>logs/requests.log</code> 집계 (<code>/metrics/summary</code>). 이 대시보드의 조회 요청도 함께 집계됩니다.</p>
+          </div>
+          <div class="head-tools">
+            <span class="updated" id="metrics-updated"></span>
+            <div class="seg" role="group" aria-label="집계 구간" id="metrics-window">
+              <button type="button" data-win="5m" class="on">5분</button>
+              <button type="button" data-win="1h">1시간</button>
+              <button type="button" data-win="6h">6시간</button>
+              <button type="button" data-win="24h">24시간</button>
+            </div>
+          </div>
+        </div>
+        <div id="metrics-body"><div class="loading">불러오는 중…</div></div>
       </div>
-      <div class="pipeline-meta">
-        <span class="pill neutral" id="pipeline-run-badge">아직 실행 안 함</span>
+
+      <div class="card">
+        <div class="section-head-row">
+          <div class="section-head">
+            <h2>드리프트 감지 기반 재학습 파이프라인</h2>
+            <p>마지막 시뮬레이션 배치와 <code>/retrain/status</code> 로 각 단계 색을 정합니다. 재학습은 요청을 붙잡지 않고 백그라운드에서 돕니다.</p>
+          </div>
+          <span class="pill neutral pipeline-badge"><span class="dot"></span>아직 실행 안 함</span>
+        </div>
+        <div class="pipeline-track pipeline-host"></div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="section-head-row">
+            <div class="section-head">
+              <h2>재학습 이력</h2>
+              <p>MLflow Model Registry <code>/registry/versions</code>. <code>@champion</code> 별칭이 붙은 버전이 현재 운영 모델입니다.</p>
+            </div>
+            <button type="button" class="btn ghost" data-action="reload-registry">새로고침</button>
+          </div>
+          <div id="versions-body"><div class="loading">불러오는 중…</div></div>
+        </div>
+        <div class="col">
+          <div class="card">
+            <div class="section-head">
+              <h2>현재 운영 모델</h2>
+              <p><code>/registry/champion</code> + <code>/health</code></p>
+            </div>
+            <div id="champion-body"><div class="loading">불러오는 중…</div></div>
+          </div>
+          <div class="card">
+            <div class="section-head-row">
+              <div class="section-head">
+                <h2>최근 알람</h2>
+                <p><code>logs/aiops.log</code> 최신 20건 (<code>/logs/alerts</code>)</p>
+              </div>
+              <button type="button" class="btn ghost" data-action="reload-alerts">새로고침</button>
+            </div>
+            <div class="alerts-host"><div class="loading">불러오는 중…</div></div>
+          </div>
+        </div>
       </div>
     </div>
-    <div class="pipeline-track" id="pipeline-track"></div>
-  </div>
+  </section>
 
-  <!-- ================= 재학습 로그 ================= -->
-  <div class="card">
-    <div class="section-head-row">
-      <div class="section-head">
-        <h2>재학습 로그</h2>
-        <p>
-          드리프트 감지·재학습 트리거는 <code>logs/aiops.log</code>에 그대로 기록됩니다.
-          <code>[WARN] drift detected</code> → <code>[INFO] retrain triggered</code> →
-          <code>[OK] new_rmse=... promoted</code> 순서로 남는지 아래에서 직접 열어 확인하세요.
-        </p>
+  <!-- =========================== Simulation =========================== -->
+  <section id="tab-simulation" data-panel="simulation" hidden>
+    <div class="col">
+      <div class="card">
+        <div class="section-head">
+          <h2>업무 규칙 시나리오</h2>
+          <p>
+            서버가 test 구간 실제 데이터를 재생하거나 규칙으로 변형한 배치(앞 20칸 맥락 + 뒤 N칸)를 만들어 슬라이딩 예측합니다.
+            최근 21건 RMSE 가 임계값을 넘으면 드리프트로 보고 champion 가중치에서 fine-tune 을 백그라운드로 시작합니다.
+          </p>
+        </div>
+        <div class="sim-controls">
+          <label>seed <input type="number" id="sim-seed" value="0" min="0" step="1" /></label>
+          <label>예측 칸 수(n_targets) <input type="number" id="sim-n" value="96" min="21" max="672" step="1" /></label>
+          <span>96칸 = 하루치(15분 × 96)</span>
+        </div>
+        <div id="scenario-list"><div class="loading">시나리오 불러오는 중…</div></div>
+      </div>
+
+      <div class="card">
+        <div class="section-head-row">
+          <div class="section-head">
+            <h2>재학습 파이프라인</h2>
+            <p>재학습이 진행 중이면 <code>/retrain/status</code> 를 2초마다 확인해 단계를 갱신합니다.</p>
+          </div>
+          <span class="pill neutral pipeline-badge"><span class="dot"></span>아직 실행 안 함</span>
+        </div>
+        <div class="pipeline-track pipeline-host"></div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="section-head-row">
+            <div class="section-head">
+              <h2>실제 vs 예측</h2>
+              <p id="sim-subtitle">시나리오를 고르면 배치 결과가 여기에 그려집니다.</p>
+            </div>
+            <div class="legend" aria-label="범례">
+              <span class="key"><svg width="22" height="8" aria-hidden="true"><line x1="1" y1="4" x2="21" y2="4" stroke="#3987e5" stroke-width="2" stroke-linecap="round"/></svg>실제 Power_Usage</span>
+              <span class="key"><svg width="22" height="8" aria-hidden="true"><line x1="1" y1="4" x2="21" y2="4" stroke="#d95926" stroke-width="2" stroke-dasharray="5 3" stroke-linecap="round"/></svg>예측</span>
+            </div>
+          </div>
+          <div class="sim-status" id="sim-status"></div>
+          <div class="chart-host" id="sim-chart"><div class="empty">아직 보낸 배치가 없습니다. 위에서 시나리오를 고르세요.</div></div>
+          <div class="chart-title">21건 이동 RMSE <span id="rmse-chart-note">서버 판정은 맨 끝 점(최근 21건) 하나입니다</span></div>
+          <div class="chart-host" id="rmse-chart"><div class="empty">배치를 보내면 21건 이동 RMSE 가 그려집니다.</div></div>
+          <div id="sim-table"></div>
+        </div>
+        <div class="col">
+          <div class="card">
+            <div class="section-head">
+              <h2>드리프트 판정</h2>
+              <p>서버 <code>drift_check</code> · 최근 21건 RMSE vs 임계값 (<code>/config</code>)</p>
+            </div>
+            <div id="drift-body"><div class="empty">배치를 보내면 판정 결과가 표시됩니다.</div></div>
+          </div>
+          <div class="card">
+            <div class="section-head">
+              <h2>재학습 상태</h2>
+              <p><code>/retrain/status</code> — 진행 중이면 2초마다 확인</p>
+            </div>
+            <div id="retrain-body"><div class="loading">불러오는 중…</div></div>
+          </div>
+          <div class="card">
+            <div class="section-head-row">
+              <div class="section-head">
+                <h2>최근 알람</h2>
+                <p>WARN → INFO → OK/FAIL 순서로 쌓이는지 확인</p>
+              </div>
+              <button type="button" class="btn ghost" data-action="reload-alerts">새로고침</button>
+            </div>
+            <div class="alerts-host"><div class="loading">불러오는 중…</div></div>
+          </div>
+        </div>
       </div>
     </div>
-    <div class="btn-row" id="log-file-list"></div>
-    <div id="log-content" class="result-box"></div>
-  </div>
+  </section>
 
-</div>
+  <!-- =========================== Datasets =========================== -->
+  <section id="tab-datasets" data-panel="datasets" hidden>
+    <div class="col">
+      <div class="grid-even">
+        <div class="card">
+          <div class="section-head">
+            <h2>CSV 업로드</h2>
+            <p>
+              KAMP 표면처리 CSV(필수 컬럼 <code>Datetime</code>, <code>Power_Usage</code> · 최소 41행).
+              <code>data/uploads/</code> 에 쌓이고, 학습은 가장 최근 파일을 씁니다(없으면 seed CSV).
+            </p>
+          </div>
+          <div class="upload-row">
+            <input type="file" id="upload-input" accept=".csv,text/csv" />
+            <button type="button" class="btn primary" id="upload-btn">업로드</button>
+          </div>
+          <div id="upload-status" style="margin-top:12px;"></div>
+        </div>
+        <div class="card">
+          <div class="section-head-row">
+            <div class="section-head">
+              <h2>현재 학습 데이터</h2>
+              <p><code>/data/status</code> — 최신 업로드(없으면 seed)의 정제 결과</p>
+            </div>
+            <button type="button" class="btn ghost" data-action="reload-data">새로고침</button>
+          </div>
+          <div id="data-status-body"><div class="loading">불러오는 중…</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="section-head">
+          <h2>데이터 품질 6지수</h2>
+          <p>가이드북 기준 가중치 — 완전성 0.2 · 유일성 0.2 · 유효성 0.2 · 일관성 0.15 · 정확성 0.15 · 무결성 0.1</p>
+        </div>
+        <div id="quality-body"><div class="loading">불러오는 중…</div></div>
+      </div>
+    </div>
+  </section>
 
-<footer>HAIC AIOps 실습 · 드리프트 감지 → 재학습 파이프라인 (serving_app/static/index.html)</footer>
+  <!-- =========================== System =========================== -->
+  <section id="tab-system" data-panel="system" hidden>
+    <div class="col">
+      <div class="grid-even">
+        <div class="card">
+          <div class="section-head-row">
+            <div class="section-head">
+              <h2>헬스 체크</h2>
+              <p><code>GET /health</code></p>
+            </div>
+            <button type="button" class="btn ghost" data-action="reload-health">새로고침</button>
+          </div>
+          <div id="health-body"><div class="loading">불러오는 중…</div></div>
+        </div>
+        <div class="card">
+          <div class="section-head">
+            <h2>서빙 설정</h2>
+            <p><code>GET /config</code> — 학습·서빙·드리프트 판정에 쓰는 상수</p>
+          </div>
+          <div id="config-body"><div class="loading">불러오는 중…</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="section-head-row">
+          <div class="section-head">
+            <h2>엔드포인트</h2>
+            <p>요청·응답 예시는 Swagger UI 에서 직접 호출해 볼 수 있습니다. GET 은 경로를 누르면 새 창으로 열립니다.</p>
+          </div>
+          <a class="btn primary" href="/docs" target="_blank" rel="noopener" style="text-decoration:none;">Swagger UI 열기 (/docs)</a>
+        </div>
+        <div id="endpoints-body"></div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>표면처리 에너지 예측 AIOps · SKALA 모델 서빙 팀 프로젝트 (serving_app/static/index.html)</footer>
 
 <script>
-/* ===================== 전역 상태 ===================== */
-// 서버(data/features.py, monitoring/drift_detector.py)와 동일한 값 (상수만 복제)
-const SEQ_LEN = 20;
-const WINDOW_SIZE = 21;
-const RMSE_THRESHOLD = 4.0;
+"use strict";
 
-let lastPipelineRun = null; // { driftCheck, clientRmse, ts }
+/* ===================== 상수 — SPEC 정본 값 (/config 를 못 읽었을 때만 쓴다) ===================== */
+const DEFAULTS = { SEQ_LEN: 20, DRIFT_WINDOW: 21, DRIFT_THRESHOLD: 25.0, GATE_MIN_SKILL: 0.20, MODEL_NAME: "Surface_Power_Predictor", ALIAS: "champion" };
+const TABS = ["dashboard", "simulation", "datasets", "system"];
+const AUTO_REFRESH_MS = 30000;   // 대시보드 조회도 requests.log 에 쌓이므로 짧게 잡지 않는다
+const N_TARGETS_MAX = 96 * 7;    // 서버 /simulate 의 n_targets 상한(le=672, docs/API.md §4)과 같게
+const RETRAIN_POLL_MS = 2000;    // SPEC §5: 재학습 상태 2초 폴링
+const PENDING_POLL_LIMIT = 15;   // 트리거 뒤 30초 안에 새 재학습이 안 보이면 폴링을 멈춘다
 
-const NORMAL_SIGMA = 0.012;
-const DRIFT_SIGMA = NORMAL_SIGMA * 3;
-const DEFAULT_BASE_PRICE = 165.0;
+// /simulate/scenarios 가 실패했을 때만 보여 주는 SPEC §2 목록
+const FALLBACK_SCENARIOS = [
+  { name: "normal", description: "정상 — test 구간 실제 데이터를 그대로 재생" },
+  { name: "new_product", description: "신규 피도금체 투입 — 표면적이 큰 제품이 들어와 조업 시간(08~18시) 전력 지표가 1.35배" },
+  { name: "equipment_fault", description: "설비 이상 — 정류기 효율 저하로 전 시간대 +40 수준 이동 + 변동(σ 20) 증가" },
+  { name: "schedule_shift", description: "조업 시간 변경 — 교대가 4시간 앞당겨져(07시 기동 → 03시) 하루 패턴이 16칸 이동" },
+];
+const SCENARIO_TITLE = { normal: "정상", new_product: "신규 피도금체 투입", equipment_fault: "설비 이상", schedule_shift: "조업 시간 변경" };
+
 const PIPELINE_STAGES = [
-  { key: "collect", title: "데이터 수집", desc: "요청 수신" },
-  { key: "monitor", title: "데이터 모니터링", desc: "예측 기록 누적" },
-  { key: "detect", title: "드리프트 감지", desc: "RMSE vs 임계치" },
-  { key: "trigger", title: "재학습 트리거", desc: "조건 충족 시 시작" },
-  { key: "train", title: "모델 학습", desc: "fine-tuning" },
-  { key: "register", title: "모델 등록", desc: "MLflow Registry" },
-  { key: "deploy", title: "배포", desc: "Production 승격" },
+  { title: "데이터 수집", desc: "15분 배치 수신" },
+  { title: "모니터링", desc: "예측·실측 쌍 누적" },
+  { title: "드리프트 감지", desc: "21건 RMSE vs 임계" },
+  { title: "재학습 트리거", desc: "백그라운드 시작" },
+  { title: "모델 학습", desc: "champion 에서 fine-tune" },
+  { title: "모델 등록", desc: "MLflow Registry" },
+  { title: "배포", desc: "@champion 승격" },
 ];
 
+const QUALITY_INDICES = [
+  { key: "completeness", name: "완전성", weight: 0.20, desc: "결측 없는 셀 비율" },
+  { key: "uniqueness", name: "유일성", weight: 0.20, desc: "고유 타임스탬프 비율" },
+  { key: "validity", name: "유효성", weight: 0.20, desc: "형식 파싱 성공 & 15분 격자 위" },
+  { key: "consistency", name: "일관성", weight: 0.15, desc: "DoW 가 날짜와 일치 (컬럼 있을 때)" },
+  { key: "accuracy", name: "정확성", weight: 0.15, desc: "값 범위 안 (습도 0~100, 전력·생산량 > 0)" },
+  { key: "integrity", name: "무결성", weight: 0.10, desc: "유일·유효·일관 모두 100 이면 100, 아니면 셋의 최솟값" },
+];
+
+const ENDPOINTS = [
+  ["POST", "/predict", "다음 15분 Power_Usage 예측 (20칸 시퀀스)"],
+  ["POST", "/predict/batch-test", "연속 행 슬라이딩 예측 · 드리프트 판정 · 드리프트면 백그라운드 재학습"],
+  ["POST", "/simulate/{scenario}", "서버가 시나리오 배치를 만들어 batch-test 와 같은 처리"],
+  ["GET", "/simulate/scenarios", "시나리오 목록·설명"],
+  ["GET", "/retrain/status", "재학습 상태 (idle / running / done / failed)"],
+  ["GET", "/health", "서버·모델 상태, MODEL_SOURCE, 서빙 버전"],
+  ["POST", "/data/upload", "CSV 업로드 → 저장 + 품질 리포트"],
+  ["GET", "/data/status", "현재 학습 데이터 행수·기간·구간·정제·품질"],
+  ["GET", "/metrics/summary?window=5m", "요청 로그 집계 (5m / 1h / 6h / 24h)"],
+  ["GET", "/registry/versions", "MLflow 등록 버전 이력"],
+  ["GET", "/registry/champion", "현재 @champion 버전"],
+  ["GET", "/logs", "로그 파일 목록"],
+  ["GET", "/logs/{name}", "로그 파일 내용 (경로 탈출 방지)"],
+  ["GET", "/logs/alerts?limit=20", "aiops.log 알람 (최신 먼저)"],
+  ["GET", "/config", "서빙·드리프트 설정 상수"],
+  ["GET", "/", "이 대시보드"],
+];
+
+// 알람 수준별 아이콘·색 — 색만으로 구분하지 않도록 아이콘과 수준 글자를 같이 붙인다
+const LEVEL_META = {
+  WARN: { cls: "lv-warn", icon: "warn" },
+  WARNING: { cls: "lv-warn", icon: "warn" },
+  INFO: { cls: "lv-info", icon: "info" },
+  OK: { cls: "lv-ok", icon: "ok" },
+  FAIL: { cls: "lv-fail", icon: "fail" },
+  ERROR: { cls: "lv-error", icon: "error" },
+  CRITICAL: { cls: "lv-error", icon: "error" },
+};
+
+const ICON_PATHS = {
+  warn: '<path d="M12 3.5 2.5 20h19L12 3.5z"/><path d="M12 10v4.5"/><path d="M12 17.3h.01"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><path d="M12 7.6h.01"/>',
+  ok: '<circle cx="12" cy="12" r="9"/><path d="m8 12.3 2.8 2.8L16.2 9.6"/>',
+  fail: '<circle cx="12" cy="12" r="9"/><path d="m9 9 6 6"/><path d="m15 9-6 6"/>',
+  error: '<path d="M8.2 2.8h7.6l5.4 5.4v7.6l-5.4 5.4H8.2l-5.4-5.4V8.2z"/><path d="M12 7.5v5.5"/><path d="M12 16.4h.01"/>',
+  other: '<circle cx="12" cy="12" r="4"/>',
+};
+function icon(name, size) {
+  const s = size || 16;
+  return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name] || ICON_PATHS.other}</svg>`;
+}
+
+/* ===================== 전역 상태 ===================== */
+const state = {
+  config: null, configErr: null,
+  health: null, healthErr: null,
+  champion: undefined, championErr: null,
+  retrain: null, retrainErr: null,
+  lastSim: null,          // { scenario, description, preds, drift_check, at, seed, n, baseline, expectNew }
+  metricsWindow: "5m",
+  scenarios: null,
+  simBusy: false,
+  pendingPolls: 0,
+  pollErrors: 0,
+  retrainTimedOut: false,
+  pollStartedAt: null,    // 이번 폴링을 시작한 브라우저 시각 (진행 중 경과 표시용)
+  retrainNotice: null,    // 재학습이 끝났을 때 시뮬레이션 상태줄에 붙일 문구
+  championStale: false,   // /health 의 서빙 버전이 바뀌어 /registry/champion 을 다시 읽는 중 (그동안 버전 불일치 경고를 띄우지 않는다)
+};
+
 /* ===================== 유틸 ===================== */
-function randn() {
-  let u = 0, v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+const pad2 = (n) => String(n).padStart(2, "0");
+const WEEK = ["일", "월", "화", "수", "목", "금", "토"];
+
+// 서버 값은 전부 신뢰하지 않는 데이터 — innerHTML 에 넣기 전에 반드시 이스케이프한다
+function esc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
-function randomWalk(n, base, sigma) {
-  const prices = [];
-  let logPrice = Math.log(base);
-  for (let i = 0; i < n; i++) { logPrice += randn() * sigma; prices.push(Math.exp(logPrice)); }
-  return prices;
+function num(v) {
+  if (v === null || v === undefined || v === "" || typeof v === "boolean") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
-function rmseOf(actual, predicted) {
-  const n = Math.min(actual.length, predicted.length);
-  if (n === 0) return null;
-  let sum = 0;
-  for (let i = 0; i < n; i++) sum += (actual[i] - predicted[i]) ** 2;
-  return Math.sqrt(sum / n);
+function fmtNum(v, d) {
+  const n = num(v);
+  if (n === null) return "—";
+  const dd = d == null ? 2 : d;
+  return n.toLocaleString("ko-KR", { minimumFractionDigits: dd, maximumFractionDigits: dd });
 }
-function relTime(ts) {
-  if (!ts) return "-";
-  const diff = Math.max(0, Date.now() / 1000 - ts);
+function fmtInt(v) { const n = num(v); return n === null ? "—" : Math.round(n).toLocaleString("ko-KR"); }
+function fmtVer(v) {
+  if (v === null || v === undefined || v === "") return "—";
+  const s = String(v);
+  return /^v/i.test(s) ? s : "v" + s;
+}
+// "2026-10-01 15:40:12,345"(logging asctime) · ISO · epoch 초/밀리초를 모두 받는다. 오프셋 없는 ISO 는 로컬 시각으로 읽힌다.
+function parseTs(v) {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "number") return new Date(v < 1e12 ? v * 1000 : v);
+  const s = String(v).trim().replace(" ", "T").replace(",", ".");
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+function fmtDateTime(d, withSec) {
+  if (!d) return "—";
+  const base = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  return withSec ? `${base}:${pad2(d.getSeconds())}` : base;
+}
+function fmtShort(d) { return d ? `${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}` : "—"; }
+function fmtClock(d) { return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`; }
+function fmtTsText(v, withSec) { const d = parseTs(v); return d ? fmtDateTime(d, withSec) : (v ? String(v) : "—"); }
+function relTime(ms) {
+  const diff = Math.max(0, (Date.now() - ms) / 1000);
   if (diff < 60) return `${Math.floor(diff)}초 전`;
   if (diff < 3600) return `${Math.floor(diff / 60)}분 전`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}시간 전`;
   return `${Math.floor(diff / 86400)}일 전`;
 }
-async function getJSON(path) {
-  const res = await fetch(path);
-  const data = await res.json().catch(() => null);
-  return { ok: res.ok, status: res.status, data };
+function fmtDuration(sec) {
+  if (sec === null || !Number.isFinite(sec) || sec < 0) return "—";
+  if (sec < 60) return `${sec.toFixed(1)}초`;
+  return `${Math.floor(sec / 60)}분 ${Math.round(sec % 60)}초`;
 }
-// 서버가 500 등을 일반 텍스트("Internal Server Error")로 응답할 수도 있어
-// (예: model_loader.py의 _load_from_mlflow TODO가 아직 NotImplementedError를 던지는 경우),
-// res.json()을 바로 쓰지 않고 텍스트로 먼저 받아 파싱을 시도한다.
-async function safeJson(res) {
+function pill(cls, text) { return `<span class="pill ${cls}"><span class="dot"></span>${esc(text)}</span>`; }
+// rows: [라벨, 이미 이스케이프된 HTML, mono 여부]
+function kvHtml(rows) {
+  return `<dl class="kv">${rows.map(([k, v, mono]) => `<dt>${esc(k)}</dt><dd class="${mono ? "mono" : ""}">${v}</dd>`).join("")}</dl>`;
+}
+function rawDetails(obj, label) {
+  return `<details class="raw"><summary>${esc(label || "원본 응답 보기")}</summary><div class="result-box">${esc(JSON.stringify(obj, null, 2))}</div></details>`;
+}
+function firstDef() {
+  for (let i = 0; i < arguments.length; i++) if (arguments[i] !== undefined && arguments[i] !== null) return arguments[i];
+  return undefined;
+}
+// /config 값 — 서버가 대문자 키(SPEC 상수 이름)를 주든 소문자 키를 주든 받는다
+function cfg(key) {
+  const c = state.config;
+  if (c) {
+    if (c[key] !== undefined && c[key] !== null) return c[key];
+    const low = key.toLowerCase();
+    if (c[low] !== undefined && c[low] !== null) return c[low];
+  }
+  return DEFAULTS[key];
+}
+function cfgFromServer(key) { const c = state.config; return !!c && (c[key] != null || c[key.toLowerCase()] != null); }
+
+/* ===================== API 호출 · 오류 문구 ===================== */
+class ApiError extends Error {
+  constructor(status, kind, detail) { super(kind); this.status = status; this.kind = kind; this.detail = detail; }
+}
+function detailText(data) {
+  if (!data) return "";
+  if (typeof data === "string") return data.slice(0, 200);
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) {
+    // FastAPI 422: [{loc, msg, type}] → "sequence.3.power_usage: ..." 형태로 이어 붙인다
+    return data.detail.map((d) => {
+      const loc = Array.isArray(d.loc) ? d.loc.filter((x) => x !== "body").join(".") : "";
+      return (loc ? loc + ": " : "") + (d.msg || JSON.stringify(d));
+    }).join(" / ");
+  }
+  if (data.__raw !== undefined) return String(data.__raw).slice(0, 200);
+  return JSON.stringify(data).slice(0, 200);
+}
+async function api(path, options) {
+  let res;
+  try {
+    res = await fetch(path, Object.assign({ headers: { Accept: "application/json" } }, options || {}));
+  } catch (e) {
+    throw new ApiError(0, "network", e && e.message);
+  }
+  // 서버가 500 을 일반 텍스트("Internal Server Error")로 줄 수도 있어 텍스트로 먼저 받는다 (스켈레톤 safeJson 과 같은 이유)
   const text = await res.text();
-  try { return JSON.parse(text); } catch (e) { return { __raw: text || "(응답 없음)" }; }
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch (e) { data = { __raw: text }; }
+  }
+  if (!res.ok) throw new ApiError(res.status, "http", detailText(data));
+  if (data && data.__raw !== undefined) throw new ApiError(res.status, "parse", "JSON 이 아닌 응답입니다: " + String(data.__raw).slice(0, 120));
+  return data;
 }
-function showResult(el, obj, isError = false) {
-  el.classList.add("show");
-  el.style.borderColor = isError ? "var(--err)" : "var(--border)";
-  el.textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+function errText(e) {
+  if (!(e instanceof ApiError)) return "화면 처리 중 오류: " + ((e && e.message) || e);
+  if (e.status === 0) {
+    return location.protocol === "file:"
+      ? "파일(file://)로 열려 있어 API 를 부를 수 없습니다. 서버를 띄우고 http://localhost:8000/ 으로 여세요."
+      : "서버에 연결할 수 없습니다. uvicorn(또는 docker compose)이 떠 있는지 확인하세요.";
+  }
+  if (e.kind === "parse") return e.detail;
+  if (e.status === 404) return "서버에 이 API 가 없습니다(404)." + (e.detail && e.detail !== "Not Found" ? " " + e.detail : " 라우터 등록을 확인하세요.");
+  if (e.status === 422) return "입력 검증 실패(422): " + (e.detail || "요청 형식을 확인하세요.");
+  if (e.status >= 500) return `서버 오류(${e.status}): ` + (e.detail || "서버 로그를 확인하세요.");
+  return `요청 실패(${e.status}): ` + (e.detail || "");
+}
+function errorHtml(what, e, verb) {
+  return `<div class="err-box" role="alert">${icon("error", 18)}<div><div class="err-title">${esc(what)} — ${esc(verb || "불러오지 못했습니다")}</div><div class="err-msg">${esc(errText(e))}</div></div></div>`;
 }
 
-/* ===================== 데이터 업로드 ===================== */
+/* ===================== 탭 (URL 해시) ===================== */
+function currentTab() {
+  const h = (location.hash || "").replace(/^#\/?/, "").toLowerCase();
+  return TABS.includes(h) ? h : "dashboard";
+}
+function showTab() {
+  const t = currentTab();
+  $$("[data-panel]").forEach((el) => { el.hidden = el.dataset.panel !== t; });
+  $$(".tab").forEach((el) => el.setAttribute("aria-selected", String(el.dataset.tab === t)));
+  document.title = `AIOps · 표면처리 에너지 예측 — ${t.charAt(0).toUpperCase() + t.slice(1)}`;
+  if (t === "simulation") renderSimCharts();   // 숨겨진 탭에서는 폭을 잴 수 없어 보일 때 다시 그린다
+}
+
+/* ===================== 상단 바: 시계 · MODEL_SOURCE 배지 ===================== */
+function tickClock() {
+  const d = new Date();
+  $("#clock").textContent = `${d.getFullYear()}.${pad2(d.getMonth() + 1)}.${pad2(d.getDate())} (${WEEK[d.getDay()]}) ${fmtClock(d)}`;
+}
+function renderHeaderBadge() {
+  const el = $("#model-badge");
+  if (state.healthErr && !state.health) {
+    el.className = "pill err";
+    el.innerHTML = `<span class="dot"></span>서버 연결 안 됨`;
+    el.title = errText(state.healthErr);
+    return;
+  }
+  if (!state.health) return;
+  const h = state.health;
+  const ver = h.model_version;
+  el.className = "pill " + (h.status === "ok" ? "ok" : "warn");
+  el.innerHTML = `<span class="dot"></span>MODEL_SOURCE=${esc(h.model_source || "?")}${ver ? " · " + esc(fmtVer(ver)) : ""}`;
+  el.title = `loading_mode=${h.loading_mode || "?"} · model_loaded=${h.model_loaded}`;
+}
+
+/* ===================== /health ===================== */
+function servedVersion() {
+  return state.health ? (state.health.model_version == null ? null : String(state.health.model_version)) : undefined;
+}
+async function loadHealth() {
+  const before = servedVersion();   // undefined = 아직 못 읽음
+  try {
+    state.health = await api("/health");
+    state.healthErr = null;
+  } catch (e) {
+    state.healthErr = e;
+    state.health = null;
+  }
+  // 서빙 버전이 바뀌었으면(승격·다시 로드·null 로 비워짐) champion 카드가 낡았다 — 다시 읽는 동안은 불일치 경고를 접는다.
+  // 다시 읽은 뒤에도 다르면 그때 경고가 뜬다 (본래 목적: 승격 뒤 캐시가 옛 모델에 머무는지 보기).
+  const after = servedVersion();
+  const stale = before !== undefined && after !== undefined && before !== after;
+  if (stale) state.championStale = true;
+  renderHeaderBadge();
+  renderChampion();
+  renderHealthCard();
+  if (stale) loadChampion();
+}
+function renderHealthCard() {
+  const host = $("#health-body");
+  if (state.healthErr) { host.innerHTML = errorHtml("/health", state.healthErr); return; }
+  const h = state.health;
+  if (!h) return;
+  const known = ["status", "model_loaded", "loading_mode", "model_source", "model_version"];
+  const rows = [
+    ["status", h.status === "ok" ? pill("ok", "Healthy") : pill("warn", String(h.status))],
+    ["model_loaded", h.model_loaded ? pill("ok", "로드됨") : pill("neutral", "아직 안 됨 (lazy 면 첫 요청 때 로드)")],
+    ["loading_mode", esc(h.loading_mode || "—"), true],
+    ["model_source", esc(h.model_source || "—"), true],
+    ["model_version", esc(h.model_version ? fmtVer(h.model_version) : "—"), true],
+  ];
+  Object.keys(h).filter((k) => !known.includes(k)).forEach((k) => rows.push([k, esc(typeof h[k] === "object" ? JSON.stringify(h[k]) : h[k]), true]));
+  const degraded = h.status === "degraded"
+    ? `<div class="note warn">${icon("warn", 13)} Eager 모드인데 모델이 캐시에 없습니다 — 기동 때 로드가 실패했을 수 있습니다(/predict 는 503). 서버 로그의 [eager] 줄을 보세요.</div>` : "";
+  host.innerHTML = kvHtml(rows) + degraded + `<div class="note">확인 시각 ${esc(fmtClock(new Date()))}</div>`;
+}
+
+/* ===================== /config ===================== */
+async function loadConfig() {
+  const host = $("#config-body");
+  try {
+    state.config = await api("/config");
+    state.configErr = null;
+    const c = state.config || {};
+    const scalar = (v) => v === null || v === undefined ? '<span style="color:var(--faint)">—</span>'
+      : Array.isArray(v) ? `<div class="chips">${v.map((x) => `<span class="chip">${esc(typeof x === "object" ? JSON.stringify(x) : x)}</span>`).join("")}</div>`
+      : (typeof v === "object" ? esc(JSON.stringify(v)) : esc(v));
+    const keys = Object.keys(c).filter((k) => k !== "error");
+    const flat = keys.filter((k) => !(c[k] && typeof c[k] === "object" && !Array.isArray(c[k])));
+    const nested = keys.filter((k) => c[k] && typeof c[k] === "object" && !Array.isArray(c[k]));
+    const nestedLabel = { model: "현재 모델 (model)", versions: "라이브러리 버전 (versions)" };
+    host.innerHTML = (keys.length ? kvHtml(flat.map((k) => [k, scalar(c[k]), !Array.isArray(c[k])])) : `<div class="empty">설정 값이 비어 있습니다.</div>`) +
+      nested.map((k) => `<div class="champ-block"><div class="block-label">${esc(nestedLabel[k] || k)}</div>${kvHtml(Object.keys(c[k]).map((kk) => [kk, scalar(c[k][kk]), true]))}</div>`).join("") +
+      (c.error ? `<div class="note warn">${icon("warn", 13)} ${esc(c.error)}</div>` : "");
+  } catch (e) {
+    state.configErr = e;
+    host.innerHTML = errorHtml("/config", e) +
+      `<div class="note">판정 임계값은 SPEC 기본값(DRIFT_WINDOW ${DEFAULTS.DRIFT_WINDOW}, DRIFT_THRESHOLD ${DEFAULTS.DRIFT_THRESHOLD})으로 표시합니다.</div>`;
+  }
+  if (state.lastSim) { renderSimStatus(); renderDrift(); renderSimCharts(); }
+}
+
+/* ===================== 운영 지표 요약 ===================== */
+async function loadMetrics() {
+  const host = $("#metrics-body");
+  const win = state.metricsWindow;
+  host.classList.add("refreshing");
+  try {
+    const d = await api(`/metrics/summary?window=${encodeURIComponent(win)}`);
+    if (win === state.metricsWindow) renderMetrics(d || {});
+  } catch (e) {
+    host.innerHTML = errorHtml("운영 지표(/metrics/summary)", e);
+  } finally {
+    host.classList.remove("refreshing");
+    $("#metrics-updated").textContent = "갱신 " + fmtClock(new Date());
+  }
+}
+function normalizeByPath(bp) {
+  if (!bp) return [];
+  const cnt = (r) => num(firstDef(r.count, r.total, r.n, r.requests));
+  if (Array.isArray(bp)) {
+    return bp.map((r) => ({ path: r.path || r.name || "?", count: cnt(r), errors: num(r.errors), p95: num(r.p95_ms) }));
+  }
+  return Object.entries(bp).map(([path, v]) => (v && typeof v === "object")
+    ? { path, count: cnt(v), errors: num(v.errors), p95: num(v.p95_ms) }
+    : { path, count: num(v), errors: null, p95: null });
+}
+function renderMetrics(d) {
+  const total = num(d.total);
+  const errors = num(d.errors);
+  let ratePct = null;
+  if (total !== null && total > 0 && errors !== null) ratePct = (errors / total) * 100;
+  else if (num(d.error_rate) !== null) { const r = num(d.error_rate); ratePct = r <= 1 ? r * 100 : r; }
+  else if (total === 0) ratePct = 0;
+  const rateCls = ratePct === null ? "neutral" : ratePct === 0 ? "ok" : ratePct < 5 ? "warn" : "err";
+  const rateLabel = ratePct === null ? "—" : ratePct === 0 ? "오류 없음" : ratePct < 5 ? "주의" : "높음";
+  const ms = (v) => { const n = num(v); return n === null ? "—" : n.toLocaleString("ko-KR", { maximumFractionDigits: n < 10 ? 1 : 0 }); };
+  const winLabel = { "5m": "5분", "1h": "1시간", "6h": "6시간", "24h": "24시간" }[state.metricsWindow] || state.metricsWindow;
+
+  const tiles = `
+    <div class="tiles">
+      <div class="tile"><div class="tile-label">총 요청</div><div class="tile-value">${fmtInt(total)}</div><div class="tile-sub">최근 ${esc(winLabel)}</div></div>
+      <div class="tile"><div class="tile-label">오류율</div><div class="tile-value">${ratePct === null ? "—" : fmtNum(ratePct, 1)}<small>%</small></div><div class="tile-sub">${pill(rateCls, rateLabel)}${errors === null ? "" : `<span>${fmtInt(errors)}건${num(d.errors_5xx) !== null ? ` · 5xx ${fmtInt(d.errors_5xx)}` : ""}</span>`}</div></div>
+      <div class="tile"><div class="tile-label">응답 시간 p50</div><div class="tile-value">${ms(d.p50_ms)}<small>ms</small></div><div class="tile-sub">중앙값</div></div>
+      <div class="tile"><div class="tile-label">응답 시간 p95</div><div class="tile-value">${ms(d.p95_ms)}<small>ms</small></div><div class="tile-sub">느린 5% 경계</div></div>
+    </div>`;
+
+  const paths = normalizeByPath(d.by_path).sort((a, b) => (b.count || 0) - (a.count || 0));
+  const top = paths.slice(0, 7);
+  const hasErr = top.some((r) => r.errors !== null);
+  const hasP95 = top.some((r) => r.p95 !== null);
+  const pathTable = top.length
+    ? `<table><thead><tr><th>경로</th><th class="num">요청</th>${hasErr ? '<th class="num">오류</th>' : ""}${hasP95 ? '<th class="num">p95 ms</th>' : ""}</tr></thead><tbody>${
+        top.map((r) => `<tr><td class="mono">${esc(r.path)}</td><td class="num">${fmtInt(r.count)}</td>${hasErr ? `<td class="num">${fmtInt(r.errors)}</td>` : ""}${hasP95 ? `<td class="num">${r.p95 === null ? "—" : fmtNum(r.p95, 0)}</td>` : ""}</tr>`).join("")
+      }</tbody></table>${paths.length > top.length ? `<div class="note">외 ${paths.length - top.length}개 경로</div>` : ""}`
+    : `<div class="empty">이 구간에 들어온 요청이 없습니다.</div>`;
+
+  $("#metrics-body").innerHTML = `<div class="metrics-wrap">${tiles}<div><div class="block-label">경로별 요청 (상위)</div>${pathTable}</div></div>`;
+}
+
+/* ===================== 파이프라인 7단계 ===================== */
+// 재학습 상태를 「이번 시뮬레이션이 일으킨 재학습」 기준으로 해석한다.
+//   pending : 트리거는 됐는데 서버 상태에 아직 새 실행이 안 보임 (started_at 이 트리거 전 값과 같음)
+//   서버·브라우저 시계(도커 UTC 등)는 비교하지 않는다.
+function retrainView() {
+  const rs = state.retrain;
+  const sim = state.lastSim;
+  const s = rs && rs.state;
+  if (s === "running") return "running";
+  if (sim && sim.expectNew && !state.retrainTimedOut) {
+    if (!rs || !s || s === "idle" || (rs.started_at == null ? null : rs.started_at) === sim.baseline) return "pending";
+  }
+  return s || "unknown";
+}
+function isDriftStatus(dc) { return !!dc && (dc.status === "retrain_triggered" || dc.status === "retrain_running"); }
+// drift_check.status 가 "ok" 여도 rmse 가 null 이면 21건이 안 차서 판단을 미룬 것이다 (정상과 구분)
+function driftKind(dc) {
+  if (!dc) return "none";
+  if (dc.status === "retrain_triggered") return "triggered";
+  if (dc.status === "retrain_running") return "running";
+  if (dc.status === "ok") return num(dc.rmse) === null ? "hold" : "ok";
+  return "unknown";
+}
+// 판정에 쓴 창·임계값 — 서버가 drift_check 에 실어 보낸 값이 있으면 그것이 정본, 없으면 /config, 그다음 SPEC 기본값
+function judgeParams(dc) {
+  const thr = num(dc && dc.threshold) !== null ? num(dc.threshold) : num(cfg("DRIFT_THRESHOLD"));
+  const win = num(dc && dc.window) !== null ? num(dc.window) : (num(cfg("DRIFT_WINDOW")) || DEFAULTS.DRIFT_WINDOW);
+  const src = num(dc && dc.threshold) !== null ? "drift_check" : (cfgFromServer("DRIFT_THRESHOLD") ? "/config" : "SPEC 기본값");
+  return { thr, win, src };
+}
+function computePipeline() {
+  const st = PIPELINE_STAGES.map(() => ({ s: "idle", t: "대기" }));
+  const sim = state.lastSim;
+  const rs = state.retrain;
+  const view = retrainView();
+  const dc = sim ? (sim.drift_check || {}) : null;
+  let badge = { cls: "neutral", text: "아직 실행 안 함" };
+  let retrainPath = false;
+
+  if (sim) {
+    st[0] = { s: "ok", t: `${sim.preds.length}건 예측` };
+    st[1] = { s: "ok", t: "예측·실측 누적" };
+    const kind = driftKind(dc);
+    if (kind === "ok") st[2] = { s: "ok", t: `정상 · RMSE ${fmtNum(dc.rmse, 1)}` };
+    else if (isDriftStatus(dc)) st[2] = { s: "warn", t: `감지 · RMSE ${fmtNum(dc.rmse, 1)}` };
+    else if (kind === "hold") st[2] = { s: "idle", t: `판단 보류 (${judgeParams(dc).win}건 미만)` };
+    else st[2] = { s: "idle", t: String(dc.status || "알 수 없음") };
+    retrainPath = isDriftStatus(dc);
+    badge = { cls: retrainPath ? "warn" : "ok", text: `마지막 시뮬레이션: ${scenarioTitle(sim.scenario)} · ${relTime(sim.at)}` };
+  } else if (rs && rs.state && rs.state !== "idle") {
+    // 이 화면에서 보낸 배치는 없지만 서버에 재학습 기록이 있다 (CLI·다른 창에서 보낸 경우)
+    st[0] = { s: "ok", t: "이전 배치" };
+    st[1] = { s: "ok", t: "누적됨" };
+    st[2] = { s: "warn", t: "드리프트 감지됨" };
+    retrainPath = true;
+    badge = { cls: "neutral", text: "서버 재학습 상태 기준 (이 화면에서 보낸 배치 없음)" };
+  }
+
+  if (retrainPath) {
+    const notMine = !!dc && dc.status === "retrain_running";   // 이 배치가 아니라 앞 배치가 시작한 재학습
+    st[3] = { s: "ok", t: notMine ? "이미 진행 중 (중복 안 함)" : "백그라운드 시작" };
+    if (notMine && (view === "done" || view === "failed")) {
+      // 끝난 재학습은 앞 배치 데이터로 돈 것이다 — 이 배치의 결과처럼 초록으로 칠하지 않는다
+      st[4] = { s: "idle", t: "앞 배치의 재학습 — 이 배치 아님" };
+      st[5] = { s: "idle", t: "—" };
+      st[6] = { s: "idle", t: "이 배치는 재학습 안 됨" };
+    } else if (view === "pending") {
+      st[4] = { s: "run", t: "시작 대기…" };
+    } else if (view === "running") {
+      st[4] = { s: "run", t: retrainTimer && pollElapsedText() ? `fine-tune 중 · ${pollElapsedText()}` : "fine-tune 중…" };
+      badge = { cls: "run", text: "재학습 진행 중 — 2초마다 확인" };
+    } else if (view === "failed") {
+      st[4] = { s: "err", t: "학습 실패" };
+      st[5] = { s: "idle", t: "등록 안 함" };
+      st[6] = { s: "idle", t: "기존 champion 유지" };
+    } else if (view === "done") {
+      const r = (rs && rs.result) || {};
+      st[4] = { s: "ok", t: `도전자 RMSE ${fmtNum(r.challenger_rmse, 1)}` };
+      if (isExternalSkip(r)) {
+        st[4] = { s: "idle", t: "건너뜀 (champion 외부 변경)" };
+        st[5] = { s: "idle", t: "등록 안 함" };
+        st[6] = { s: "warn", t: `${fmtVer(r.champion)} 다시 읽음` };
+      } else if (r.promoted) {
+        st[5] = { s: "ok", t: r.version != null ? `${fmtVer(r.version)} 등록` : "등록 완료" };
+        st[6] = { s: "ok", t: "champion 승격" };
+      } else {
+        st[5] = { s: "warn", t: "게이트 탈락" };
+        st[6] = { s: "idle", t: "기존 champion 유지" };
+      }
+    } else if (state.retrainTimedOut) {
+      st[4] = { s: "err", t: "시작 확인 못 함" };
+    }
+  }
+  if (state.retrainErr) badge = { cls: "err", text: "서버 연결 안 됨 — 마지막으로 본 상태" };
+  return { st, badge };
+}
+// 재학습 스레드가 champion 이 바깥에서 바뀐 것을 보고 fine-tune 없이 끝낸 결과 (retrain_trigger._champion_changed_outside)
+function isExternalSkip(r) { return !!r && r.served != null && r.champion != null && r.challenger_rmse == null; }
+function renderPipelines() {
+  const { st, badge } = computePipeline();
+  const html = PIPELINE_STAGES.map((s, i) => `
+    <div class="pipe-stage ${st[i].s}">
+      <div class="pipe-num">${i + 1}</div>
+      <div class="pipe-title">${esc(s.title)}</div>
+      <div class="pipe-desc">${esc(s.desc)}</div>
+      <div class="pipe-status">${esc(st[i].t)}</div>
+    </div>`).join("");
+  $$(".pipeline-host").forEach((el) => { el.innerHTML = html; });
+  $$(".pipeline-badge").forEach((el) => {
+    el.className = `pill ${badge.cls} pipeline-badge`;
+    el.innerHTML = `<span class="dot"></span>${esc(badge.text)}`;
+  });
+}
+
+/* ===================== 재학습 이력 · 현재 운영 모델 ===================== */
+function modeLabel(m) {
+  if (!m) return "—";
+  const s = String(m);
+  if (s === "scratch") return "scratch · 기준 학습";
+  if (s === "fine-tune" || s === "fine_tune") return "fine-tune · 재학습";
+  return s;
+}
+function aliasList(a) {
+  if (!a) return [];
+  if (Array.isArray(a)) return a.map(String);
+  return String(a).split(",").map((x) => x.trim()).filter(Boolean);
+}
+async function loadVersions() {
+  const host = $("#versions-body");
+  host.classList.add("refreshing");
+  try {
+    const d = await api("/registry/versions");
+    renderVersions(Array.isArray(d) ? d : ((d && (d.versions || d.items)) || []));
+  } catch (e) {
+    host.innerHTML = errorHtml("재학습 이력(/registry/versions)", e);
+  } finally {
+    host.classList.remove("refreshing");
+  }
+}
+function renderVersions(list) {
+  const host = $("#versions-body");
+  if (!list.length) {
+    host.innerHTML = `<div class="empty">아직 등록된 버전이 없습니다.<br><code>python -m serving_app.train_and_register</code> 로 기준 모델을 먼저 등록하세요.</div>`;
+    return;
+  }
+  const champAlias = String(cfg("ALIAS") || "champion");
+  const rows = list.slice().sort((a, b) => (num(b.version) || 0) - (num(a.version) || 0)).map((v) => {
+    const aliases = aliasList(v.aliases);
+    const isChamp = aliases.includes(champAlias);
+    const runId = v.run_id ? String(v.run_id) : "";
+    const aliasHtml = aliases.length
+      ? aliases.map((a) => a === champAlias ? pill("run", "@" + a) : `<span class="chip">@${esc(a)}</span>`).join(" ")
+      : '<span style="color:var(--faint)">—</span>';
+    return `<tr class="${isChamp ? "champion" : ""}">
+      <td><b>${esc(fmtVer(v.version))}</b></td>
+      <td>${esc(fmtTsText(v.created_at))}</td>
+      <td>${esc(modeLabel(v.mode))}</td>
+      <td class="num">${fmtNum(v.rmse, 2)}</td>
+      <td>${aliasHtml}${v.retired_at ? ` <span class="chip" title="champion 에서 내려온 시각">은퇴 ${esc(fmtTsText(v.retired_at))}</span>` : ""}</td>
+      <td class="mono" title="${esc(runId)}">${esc(runId.slice(0, 8)) || "—"}</td>
+    </tr>`;
+  }).join("");
+  host.innerHTML = `
+    <div class="table-scroll"><table>
+      <thead><tr><th>버전</th><th>등록 시각</th><th>모드</th><th class="num">RMSE</th><th>별칭</th><th>run</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="note">총 ${list.length}개 버전 · RMSE 는 scratch 면 val RMSE, fine-tune 이면 홀드아웃 도전자 RMSE 입니다.</div>`;
+}
+async function loadChampion() {
+  try {
+    state.champion = await api("/registry/champion");
+    state.championErr = null;
+  } catch (e) {
+    state.championErr = e;
+    state.champion = undefined;
+  }
+  state.championStale = false;
+  renderChampion();
+}
+function renderChampion() {
+  const host = $("#champion-body");
+  const h = state.health;
+  const c = state.champion;
+  let healthPart;
+  if (state.healthErr) healthPart = errorHtml("서버 상태(/health)", state.healthErr);
+  else if (!h) healthPart = `<div class="loading">서버 상태 확인 중…</div>`;
+  else {
+    healthPart = `
+      <div class="champ-head">
+        <div style="display:flex;gap:6px;flex-wrap:wrap">${h.status === "ok" ? pill("ok", "Healthy") : pill("warn", "상태: " + h.status)}
+             ${h.model_loaded ? pill("ok", "모델 로드됨") : pill("neutral", "모델 미로드")}</div>
+        <span class="pill neutral">${esc(String(h.loading_mode || "?").toUpperCase())}</span>
+      </div>
+      ${kvHtml([
+        ["서빙 중 버전", `<b>${esc(h.model_version ? fmtVer(h.model_version) : "—")}</b>`],
+        ["MODEL_SOURCE", esc(h.model_source || "—"), true],
+      ])}
+      ${!h.model_loaded ? `<div class="note">모델이 아직 캐시에 없습니다. lazy 모드이거나, 승격 직후 캐시를 비운 상태면 다음 예측 요청 때 새 버전을 읽습니다.</div>` : ""}`;
+  }
+
+  let champPart;
+  const modelName = cfg("MODEL_NAME");
+  const alias = cfg("ALIAS");
+  if (state.championErr) champPart = errorHtml("Registry champion(/registry/champion)", state.championErr);
+  else if (c === undefined) champPart = `<div class="loading">Registry 확인 중…</div>`;
+  else if (c === null || (typeof c === "object" && !Object.keys(c).length)) {
+    champPart = `<div class="empty">@${esc(alias)} 별칭이 붙은 버전이 없습니다.<br>MODEL_SOURCE=local 이면 <code>power_v1.keras</code>(v1-local)로 서빙합니다.</div>`;
+  } else {
+    const ver = firstDef(c.version, c.model_version);
+    const metrics = c.metrics || {};
+    const rmse = firstDef(c.rmse, c.val_rmse, c.challenger_rmse, metrics.val_rmse, metrics.challenger_rmse);
+    const runId = c.run_id ? String(c.run_id) : "";
+    champPart = `
+      <div class="champ-head">
+        <div><div class="champ-name">${esc(c.name || modelName)}@${esc(alias)}</div><div class="champ-ver">${esc(fmtVer(ver))}</div></div>
+        ${pill("run", "@" + alias)}
+      </div>
+      ${kvHtml([
+        ["등록 시각", esc(fmtTsText(c.created_at))],
+        ["모드", esc(modeLabel(c.mode))],
+        ["RMSE", fmtNum(rmse, 2)],
+        ["run_id", esc(runId ? runId.slice(0, 12) + (runId.length > 12 ? "…" : "") : "—"), true],
+        ...(c.model_uri ? [["model_uri", esc(c.model_uri), true]] : []),
+      ])}`;
+    // 승격 뒤 캐시가 옛 모델을 계속 쓰는 함정(부록 6)을 화면에서 바로 보이게 한다.
+    // 서빙 버전이 막 바뀌어 champion 을 다시 읽는 중이면(championStale) 아직 판단하지 않는다 — 거짓 경고 방지.
+    // 서버 밖(train_and_register.py · MLflow UI)에서 alias 를 옮겨도 여기 걸린다: 서빙 캐시는 재학습 때만 다시 읽는다.
+    if (!state.championStale && h && h.model_loaded && h.model_source === "mlflow" && h.model_version && ver != null && fmtVer(h.model_version) !== fmtVer(ver)) {
+      champPart += `<div class="note warn">${icon("warn", 13)} champion(${esc(fmtVer(ver))})이 바뀌었는데 서빙 캐시는 옛 버전(${esc(fmtVer(h.model_version))}) — 서버 재시작 또는 다음 재학습 때 다시 읽습니다.</div>`;
+    }
+  }
+  host.innerHTML = `<div class="champ-block">${champPart}</div><div class="champ-block"><div class="block-label">서빙 프로세스</div>${healthPart}</div>`;
+}
+
+/* ===================== 최근 알람 ===================== */
+async function loadAlerts() {
+  const hosts = $$(".alerts-host");
+  hosts.forEach((h) => h.classList.add("refreshing"));
+  try {
+    const d = await api("/logs/alerts?limit=20");
+    const html = alertsHtml(Array.isArray(d) ? d : ((d && (d.alerts || d.items)) || []));
+    hosts.forEach((h) => { h.innerHTML = html; });
+  } catch (e) {
+    hosts.forEach((h) => { h.innerHTML = errorHtml("최근 알람(/logs/alerts)", e); });
+  } finally {
+    hosts.forEach((h) => h.classList.remove("refreshing"));
+  }
+}
+function alertsHtml(list) {
+  if (!list.length) {
+    return `<div class="empty">아직 알람이 없습니다.<br>드리프트 시나리오를 보내면 WARN → INFO → OK(또는 FAIL) 순서로 쌓입니다.</div>`;
+  }
+  return `<ul class="alerts">${list.map((a) => {
+    // tag = 메시지 머리의 [WARN]/[INFO]/[OK]/[FAIL]/[ERROR], level = 파이썬 logging 수준(WARNING/INFO/ERROR).
+    // [OK]·[FAIL] 은 logging 상 INFO/WARNING 으로 찍히므로 tag 를 먼저 본다.
+    const lv = String(a.tag || a.level || "").toUpperCase();
+    const meta = LEVEL_META[lv] || { cls: "lv-other", icon: "other" };
+    const d = parseTs(a.ts);
+    return `<li class="alert">
+      <span class="${meta.cls}">${icon(meta.icon, 17)}</span>
+      <span class="lv ${meta.cls}">${esc(lv || "—")}</span>
+      <div><div class="msg">${esc(a.message)}</div><div class="ts">${esc(d ? fmtDateTime(d, true) + " · " + relTime(d.getTime()) : (a.ts || ""))}</div></div>
+    </li>`;
+  }).join("")}</ul>`;
+}
+
+/* ===================== 시뮬레이션: 시나리오 ===================== */
+function normalizeScenarios(d) {
+  if (!d) return [];
+  if (Array.isArray(d)) {
+    return d.map((x) => (typeof x === "string")
+      ? { name: x, description: "" }
+      : { name: x.name || x.scenario || x.key || x.id, description: x.description || x.desc || "" }).filter((x) => x.name);
+  }
+  if (d.scenarios) return normalizeScenarios(d.scenarios);
+  return Object.entries(d).map(([name, v]) => ({ name, description: typeof v === "string" ? v : ((v && (v.description || v.desc)) || "") }));
+}
+function splitDesc(name, description) {
+  // "설비 이상 — 정류기 효율 저하로 ..." → 제목 / 설명
+  const s = String(description || "");
+  const i = s.indexOf(" — ");
+  if (i > 0) return { title: s.slice(0, i), body: s.slice(i + 3) };
+  return { title: SCENARIO_TITLE[name] || name, body: s };
+}
+function scenarioTitle(name) {
+  const list = state.scenarios || FALLBACK_SCENARIOS;
+  const found = list.find((x) => x.name === name);
+  return found ? splitDesc(found.name, found.description).title : (SCENARIO_TITLE[name] || name);
+}
+async function loadScenarios() {
+  const host = $("#scenario-list");
+  let err = null;
+  try {
+    const list = normalizeScenarios(await api("/simulate/scenarios"));
+    if (!list.length) throw new ApiError(200, "parse", "시나리오 목록이 비어 있습니다.");
+    state.scenarios = list;
+  } catch (e) {
+    err = e;
+    state.scenarios = null;
+  }
+  const list = state.scenarios || FALLBACK_SCENARIOS;
+  const buttons = `<div class="scenarios">${list.map((s) => {
+    const { title, body } = splitDesc(s.name, s.description);
+    const base = s.name === "normal";
+    return `<button type="button" class="scn" data-scenario="${esc(s.name)}">
+      <div class="scn-top"><span class="scn-title">${esc(title)}</span><span class="scn-kind ${base ? "base" : "drift"}">${base ? "기준선" : "드리프트"}</span></div>
+      <div class="scn-code">POST /simulate/${esc(s.name)}</div>
+      <div class="scn-desc">${esc(body)}</div>
+    </button>`;
+  }).join("")}</div>`;
+  host.innerHTML = (err
+    ? errorHtml("시나리오 목록(/simulate/scenarios)", err) + `<div class="note">아래는 SPEC §2 기본 목록입니다. 서버가 살아나면 그대로 눌러 보낼 수 있습니다.</div><div style="height:10px"></div>`
+    : "") + buttons;
+  if (state.lastSim) markActiveScenario(state.lastSim.scenario);
+  setSimBusy(state.simBusy);
+}
+function markActiveScenario(name) {
+  $$(".scn").forEach((b) => b.classList.toggle("active", b.dataset.scenario === name));
+}
+function setSimBusy(busy) {
+  state.simBusy = busy;
+  $$(".scn").forEach((b) => { b.disabled = busy; });
+}
+function readInt(sel, dflt, lo, hi) {
+  const n = parseInt($(sel).value, 10);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(hi, Math.max(lo, n));
+}
+function normalizePreds(arr) {
+  return (Array.isArray(arr) ? arr : []).map((p) => {
+    // 혹시 숫자 배열이 오더라도 화면이 죽지 않게 받는다 (SPEC 은 [{timestamp, predicted, actual}])
+    if (typeof p === "number") return { t: null, ts: "", p: p, a: null };
+    return { t: parseTs(p.timestamp), ts: p.timestamp || "", p: num(p.predicted), a: num(p.actual) };
+  });
+}
+async function runScenario(name) {
+  if (state.simBusy) return;
+  const seed = readInt("#sim-seed", 0, 0, 1e9);
+  const n = readInt("#sim-n", 96, 21, N_TARGETS_MAX);
+  setSimBusy(true);
+  markActiveScenario(name);
+  state.retrainNotice = null;
+  $("#sim-status").innerHTML = pill("run", `${scenarioTitle(name)} 배치 전송 중… (seed ${seed}, ${n}칸)`);
+
+  // 트리거 직전의 재학습 started_at 을 기억해 두고, 값이 바뀌어야 「이번 배치가 일으킨 재학습」으로 본다.
+  try {
+    state.retrain = await api("/retrain/status");
+    state.retrainErr = null;
+  } catch (e) {
+    state.retrainErr = e;   // 재학습 카드·파이프라인이 옛 값을 오류 표시 없이 보여 주지 않게 (아래 폴링에서 다시 확인한다)
+    renderRetrain();
+    renderPipelines();
+  }
+  const baseline = state.retrain ? (state.retrain.started_at == null ? null : state.retrain.started_at) : null;
+
+  try {
+    const d = (await api(`/simulate/${encodeURIComponent(name)}?seed=${seed}&n_targets=${n}`, { method: "POST" })) || {};
+    const dc = d.drift_check || {};
+    state.lastSim = {
+      scenario: d.scenario || name,
+      description: d.description || "",
+      preds: normalizePreds(d.predictions),
+      drift_check: dc,
+      at: Date.now(), seed, n, baseline,
+      expectNew: dc.status === "retrain_triggered",
+    };
+    state.retrainTimedOut = false;
+    renderSimStatus();
+    renderDrift();
+    renderSimCharts();
+    renderPipelines();
+    if (isDriftStatus(dc)) startRetrainPolling();
+    else renderRetrain();
+    loadAlerts();
+    loadMetrics();
+  } catch (e) {
+    $("#sim-status").innerHTML = errorHtml(`시뮬레이션(${scenarioTitle(name)})`, e, "실행하지 못했습니다");
+    if (e instanceof ApiError && e.status === 0) {   // 서버가 꺼졌다 — 재학습 카드도 마지막으로 본 상태임을 알린다
+      state.retrainErr = e;
+      renderRetrain();
+      renderPipelines();
+    }
+  } finally {
+    setSimBusy(false);
+  }
+}
+
+/* ===================== 시뮬레이션: 결과 그리기 ===================== */
+function rollingRmse(preds, w) {
+  const out = new Array(preds.length).fill(null);
+  for (let i = w - 1; i < preds.length; i++) {
+    let s = 0, k = 0;
+    for (let j = i - w + 1; j <= i; j++) {
+      const a = preds[j].a, p = preds[j].p;
+      if (a !== null && p !== null) { s += (a - p) * (a - p); k++; }
+    }
+    out[i] = k === w ? Math.sqrt(s / k) : null;
+  }
+  return out;
+}
+function rmseOf(pairs) {
+  let s = 0, k = 0;
+  pairs.forEach(([a, p]) => { if (a !== null && p !== null) { s += (a - p) * (a - p); k++; } });
+  return k ? Math.sqrt(s / k) : null;
+}
+function renderSimStatus() {
+  const sim = state.lastSim;
+  if (!sim) return;
+  const dc = sim.drift_check || {};
+  const { thr, win } = judgeParams(dc);
+  const kind = driftKind(dc);
+  let main;
+  if (kind === "ok") main = pill("ok", "정상 — 재학습 없음");
+  else if (kind === "triggered") main = pill("warn", "드리프트 감지 — 재학습 시작");
+  else if (kind === "running") main = pill("warn", "드리프트 감지 — 이미 재학습 중");
+  else main = pill("neutral", "판단 보류");
+  const rmse = num(dc.rmse);
+  const extra = rmse !== null ? `<span>최근 ${esc(win)}건 RMSE <b style="color:var(--text)">${fmtNum(rmse, 2)}</b> ${rmse > thr ? "&gt;" : "≤"} 임계 ${fmtNum(thr, 1)}</span>` : "";
+  const notice = state.retrainNotice ? pill(state.retrainNotice.cls, state.retrainNotice.text) : "";
+  $("#sim-status").innerHTML = `${main}${extra}${notice}`;
+  const first = sim.preds.find((p) => p.t);
+  const last = sim.preds.slice().reverse().find((p) => p.t);
+  $("#sim-subtitle").textContent = `${scenarioTitle(sim.scenario)} · seed ${sim.seed} · ${sim.preds.length}건 예측 · ` +
+    `${first ? fmtDateTime(first.t) : "—"} ~ ${last ? fmtShort(last.t) : "—"}` +
+    (dc.model_version ? ` · 예측 모델 ${fmtVer(dc.model_version)}` : "");
+}
+function renderDrift() {
+  const host = $("#drift-body");
+  const sim = state.lastSim;
+  if (!sim) return;
+  const dc = sim.drift_check || {};
+  const { thr, win, src } = judgeParams(dc);
+  const kind = driftKind(dc);
+  const rmse = num(dc.rmse);
+  const over = rmse !== null && rmse > thr;
+  const preds = sim.preds;
+  const batchRmse = rmseOf(preds.map((x) => [x.a, x.p]));
+  // 참고: 직전 실측값을 그대로 예측으로 쓴 경우(naive). 첫 칸은 직전값이 응답에 없어 뺀다.
+  const naive = rmseOf(preds.slice(1).map((x, i) => [x.a, preds[i].a]));
+  const scaleMax = Math.max(thr * 2, (rmse || 0) * 1.1, 1);
+  const fillPct = rmse === null ? 0 : Math.min(100, (rmse / scaleMax) * 100);
+  const markPct = Math.min(100, (thr / scaleMax) * 100);
+
+  let verdict;
+  if (kind === "ok") verdict = pill("ok", "정상");
+  else if (isDriftStatus(dc)) verdict = pill("warn", "드리프트");
+  else verdict = pill("neutral", "판단 보류");
+  const why = kind === "ok" ? `RMSE ${fmtNum(rmse, 2)} ≤ ${fmtNum(thr, 1)} — 재학습하지 않음`
+    : kind === "triggered" ? `RMSE ${fmtNum(rmse, 2)} > ${fmtNum(thr, 1)} — 백그라운드 fine-tune 시작 (응답은 바로 반환)`
+    : kind === "running" ? `RMSE ${fmtNum(rmse, 2)} > ${fmtNum(thr, 1)} — 이미 재학습 중이라 새로 시작하지 않음`
+    : kind === "hold" ? `예측이 ${num(dc.n) !== null ? fmtInt(dc.n) + "건뿐이라" : win + "건이 쌓이기 전이라"} 판단하지 않음`
+    : `상태: ${dc.status || "알 수 없음"}`;
+  // 서버가 붙인 설명(판단 보류 이유, 예측 중 champion 이 바뀐 경우 등)은 그대로 보여 준다
+  const serverMsg = dc.message ? `<div class="note warn">${icon("warn", 13)} ${esc(dc.message)}</div>` : "";
+
+  host.innerHTML = `
+    <div class="readout">
+      <div class="readout-main">
+        <div>
+          <div class="tile-label">최근 ${esc(win)}건 RMSE (서버 판정)</div>
+          <div class="big">${rmse === null ? "—" : fmtNum(rmse, 2)}</div>
+        </div>
+        ${verdict}
+      </div>
+      <div>
+        <div class="meter" role="img" aria-label="RMSE ${esc(fmtNum(rmse, 2))}, 임계값 ${esc(fmtNum(thr, 1))}">
+          <div class="meter-fill ${over ? "over" : "ok"}" style="width:${fillPct.toFixed(1)}%"></div>
+          <div class="meter-mark" style="left:${markPct.toFixed(1)}%"><span>임계 ${esc(fmtNum(thr, 1))}</span></div>
+        </div>
+        ${kind === "hold" && dc.message ? "" : `<div class="note" style="margin-top:6px">${esc(why)}</div>`}
+        ${serverMsg}
+      </div>
+      <div class="mini">
+        <div class="tile"><div class="tile-label">배치 전체 RMSE</div><div class="tile-value">${fmtNum(batchRmse, 2)}</div></div>
+        <div class="tile"><div class="tile-label">참고 · 직전값 RMSE</div><div class="tile-value">${fmtNum(naive, 2)}</div></div>
+        <div class="tile"><div class="tile-label">예측 모델 · 임계 출처</div><div class="tile-value" style="font-size:0.82rem">${esc(dc.model_version ? fmtVer(dc.model_version) : "—")} · ${esc(src)}</div></div>
+      </div>
+      ${rawDetails(dc, "drift_check 원본 보기")}
+    </div>`;
+}
+function renderSimCharts() {
+  const sim = state.lastSim;
+  if (!sim) return;
+  if ($("#tab-simulation").hidden) return;   // 폭을 잴 수 없으니 탭이 열릴 때 그린다
+  const preds = sim.preds;
+  const times = preds.map((p) => p.t || null);
+  const { thr, win } = judgeParams(sim.drift_check);
+  const roll = rollingRmse(preds, win);
+
+  drawLineChart($("#sim-chart"), {
+    height: 300,
+    times,
+    series: [
+      { label: "실제", cls: "ln-actual", color: "#3987e5", dash: "", values: preds.map((p) => p.a) },
+      { label: "예측", cls: "ln-pred", color: "#d95926", dash: "5 3", values: preds.map((p) => p.p) },
+    ],
+    shade: preds.length >= win ? { from: preds.length - win, to: preds.length - 1, label: `서버 판정 구간 · 최근 ${win}건` } : null,
+    tooltip: (i) => {
+      const p = preds[i];
+      const err = p.a !== null && p.p !== null ? p.p - p.a : null;
+      return {
+        head: p.t ? `${fmtDateTime(p.t)} (${WEEK[p.t.getDay()]})` : String(p.ts || `#${i + 1}`),
+        rows: [["#3987e5", "", fmtNum(p.a, 1), "실제"], ["#d95926", "5 3", fmtNum(p.p, 1), "예측"]],
+        foot: `오차 ${err === null ? "—" : (err > 0 ? "+" : "") + fmtNum(err, 1)}${roll[i] !== null ? ` · ${win}건 RMSE ${fmtNum(roll[i], 1)}` : ""}`,
+      };
+    },
+  });
+
+  // 서버는 배치의 마지막 win 건(= 이 선의 맨 끝 점) 하나로만 판정한다. 앞쪽 점은 지나간 구간이라 참고값이다
+  //  — 정상 배치에서도 앞쪽이 임계를 넘을 수 있어(정상 기간 1% 남짓) 선만 보면 판정과 어긋나 보인다.
+  const lastIdx = preds.length - 1;
+  const lastRoll = lastIdx >= 0 ? roll[lastIdx] : null;
+  drawLineChart($("#rmse-chart"), {
+    height: 170,
+    zeroBase: true,
+    times,
+    series: [{ label: `${win}건 RMSE`, cls: "ln-rmse", color: "#9085e9", dash: "", values: roll }],
+    threshold: { value: thr, label: `임계 ${fmtNum(thr, 0)}` },
+    shade: preds.length >= win ? { from: preds.length - win, to: lastIdx, label: `서버 판정 = 마지막 점 (${fmtNum(lastRoll, 2)})` } : null,
+    mark: lastRoll !== null ? { i: lastIdx, label: fmtNum(lastRoll, 1) } : null,
+    tooltip: (i) => {
+      const p = preds[i];
+      const v = roll[i];
+      let foot;
+      if (v === null) foot = `${win}건이 차기 전`;
+      else if (i === lastIdx) foot = `서버 판정값 · 임계 ${fmtNum(thr, 1)} ${v > thr ? "초과" : "이하"}`;
+      else foot = v > thr ? "임계 초과 · 참고값 (서버 판정은 마지막 점)" : `임계 ${fmtNum(thr, 1)} 이하 · 참고값`;
+      return {
+        head: p.t ? fmtDateTime(p.t) : `#${i + 1}`,
+        rows: [["#9085e9", "", v === null ? "—" : fmtNum(v, 2), `${win}건 RMSE`]],
+        foot,
+      };
+    },
+  });
+  $("#rmse-chart-note").textContent = `서버 판정은 맨 끝 점(최근 ${win}건 RMSE) 하나 · 앞쪽은 지나간 구간 참고용 · 정상 기간에도 ${fmtNum(thr, 1)} 초과가 1% 남짓 생깁니다`;
+
+  // 표 보기 — 툴팁을 못 쓰는 경우에도 모든 값을 읽을 수 있게
+  const rows = preds.map((p, i) => `<tr><td class="mono">${esc(p.t ? fmtDateTime(p.t) : p.ts)}</td><td class="num">${fmtNum(p.a, 1)}</td><td class="num">${fmtNum(p.p, 1)}</td><td class="num">${p.a !== null && p.p !== null ? fmtNum(p.p - p.a, 1) : "—"}</td><td class="num">${roll[i] === null ? "—" : fmtNum(roll[i], 2)}</td></tr>`).join("");
+  const prev = $("#sim-table details");
+  const wasOpen = !!(prev && prev.open);
+  $("#sim-table").innerHTML = `<details class="tbl"${wasOpen ? " open" : ""}><summary>표로 보기 (${preds.length}행)</summary><div class="table-scroll"><table>
+    <thead><tr><th>시각</th><th class="num">실제</th><th class="num">예측</th><th class="num">오차</th><th class="num">${esc(win)}건 RMSE</th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
+}
+
+/* ===================== 인라인 SVG 선 그래프 (외부 라이브러리 없음) ===================== */
+function niceTicks(lo, hi, count) {
+  if (!(hi > lo)) hi = lo + 1;
+  const raw = (hi - lo) / count;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+  const a = Math.floor(lo / step) * step;
+  const b = Math.ceil(hi / step) * step;
+  const ticks = [];
+  for (let v = a; v <= b + step / 2; v += step) ticks.push(Math.round(v * 1e6) / 1e6);
+  return { lo: a, hi: b, step, ticks };
+}
+// 15분 간격 시계열에서 정시 경계에 맞춘 x 눈금을 고른다
+function timeTickIdx(times, maxLabels) {
+  const n = times.length;
+  const steps = [1, 2, 4, 8, 12, 16, 24, 48, 96];   // 15분 단위: 15분 … 24시간
+  const step = steps.find((s) => n / s <= maxLabels) || 96;
+  const stepMin = step * 15;
+  let idx = [];
+  if (times.every((t) => t)) {
+    for (let i = 0; i < n; i++) {
+      const m = times[i].getHours() * 60 + times[i].getMinutes();
+      if (m % stepMin === 0) idx.push(i);
+    }
+  }
+  if (idx.length < 2) { idx = []; for (let i = 0; i < n; i += step) idx.push(i); }
+  if (idx.length > maxLabels) { const k = Math.ceil(idx.length / maxLabels); idx = idx.filter((_, j) => j % k === 0); }
+  return idx;
+}
+function drawLineChart(host, c) {
+  const n = c.times.length;
+  if (!n) { host.innerHTML = `<div class="empty">표시할 데이터가 없습니다.</div>`; return; }
+  const W = Math.max(520, Math.round(host.clientWidth || 860));
+  const H = c.height || 280;
+  const m = { l: 46, r: 56, t: 16, b: 40 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+
+  const vals = [];
+  c.series.forEach((s) => s.values.forEach((v) => { if (v !== null && Number.isFinite(v)) vals.push(v); }));
+  const hasThr = !!c.threshold && Number.isFinite(c.threshold.value);
+  if (hasThr) vals.push(c.threshold.value);
+  if (!vals.length) { host.innerHTML = `<div class="empty">아직 그릴 값이 없습니다.</div>`; return; }
+  const lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+  const padV = (hi - lo) * 0.08 || 1;
+  const tk = niceTicks(c.zeroBase ? Math.min(0, lo) : lo - padV, hi + padV, H < 200 ? 3 : 5);
+  const x = (i) => m.l + (n === 1 ? iw / 2 : (i / (n - 1)) * iw);
+  const y = (v) => m.t + ih - ((v - tk.lo) / (tk.hi - tk.lo)) * ih;
+  const half = n > 1 ? iw / (n - 1) / 2 : 6;
+  const tickDigits = tk.step < 1 ? 1 : 0;
+
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(c.series.map((s) => s.label).join(", "))} 선 그래프">`;
+  // 판정 구간 음영
+  if (c.shade) {
+    const x0 = Math.max(m.l, x(c.shade.from) - half), x1 = Math.min(m.l + iw, x(c.shade.to) + half);
+    svg += `<rect class="shade" x="${x0.toFixed(1)}" y="${m.t}" width="${(x1 - x0).toFixed(1)}" height="${ih}"/>`;
+    svg += `<text class="shade-label" x="${(x1 - 4).toFixed(1)}" y="${m.t + 12}" text-anchor="end">${esc(c.shade.label)}</text>`;
+  }
+  // y 눈금·격자 (흐리게)
+  tk.ticks.forEach((v) => {
+    const yy = y(v).toFixed(1);
+    svg += `<line class="gridline" x1="${m.l}" x2="${m.l + iw}" y1="${yy}" y2="${yy}"/>`;
+    svg += `<text x="${m.l - 8}" y="${yy}" dy="0.32em" text-anchor="end">${esc(fmtNum(v, tickDigits))}</text>`;
+  });
+  svg += `<line class="axis" x1="${m.l}" x2="${m.l + iw}" y1="${m.t + ih}" y2="${m.t + ih}"/>`;
+  // x 눈금 (시각) — 날짜가 바뀌는 첫 눈금에만 MM/DD 를 둘째 줄로
+  const maxLabels = Math.max(4, Math.floor(iw / 78));
+  let prevDay = null;
+  timeTickIdx(c.times, maxLabels).forEach((i) => {
+    const t = c.times[i];
+    const xx = x(i).toFixed(1);
+    svg += `<line class="axis" x1="${xx}" x2="${xx}" y1="${m.t + ih}" y2="${m.t + ih + 4}"/>`;
+    if (t) {
+      const day = `${pad2(t.getMonth() + 1)}/${pad2(t.getDate())}`;
+      svg += `<text x="${xx}" y="${m.t + ih + 16}" text-anchor="middle">${pad2(t.getHours())}:${pad2(t.getMinutes())}</text>`;
+      if (day !== prevDay) svg += `<text x="${xx}" y="${m.t + ih + 30}" text-anchor="middle" style="fill:var(--faint)">${day}</text>`;
+      prevDay = day;
+    } else {
+      svg += `<text x="${xx}" y="${m.t + ih + 16}" text-anchor="middle">#${i + 1}</text>`;
+    }
+  });
+  // 임계선
+  if (hasThr) {
+    const yy = y(c.threshold.value).toFixed(1);
+    svg += `<line class="thr" x1="${m.l}" x2="${m.l + iw}" y1="${yy}" y2="${yy}"/>`;
+    svg += `<text class="thr-label" x="${m.l + iw + 6}" y="${yy}" dy="0.32em">${esc(c.threshold.label)}</text>`;
+  }
+  // 계열 선 — 값이 비면 선을 끊는다
+  const ends = [];
+  c.series.forEach((s) => {
+    let d = "", pen = false, lastI = -1;
+    s.values.forEach((v, i) => {
+      if (v === null || !Number.isFinite(v)) { pen = false; return; }
+      d += (pen ? "L" : "M") + x(i).toFixed(1) + "," + y(v).toFixed(1);
+      pen = true; lastI = i;
+    });
+    if (d) svg += `<path class="ln ${s.cls}" d="${d}"/>`;
+    if (lastI >= 0 && c.series.length > 1) ends.push({ s, yy: y(s.values[lastI]), xx: x(lastI) });
+  });
+  // 강조 점 (선택): c.mark = {i, label} — 첫 계열의 i 번째 값에 점과 라벨 (예: 서버가 판정에 쓴 마지막 점)
+  if (c.mark && Number.isInteger(c.mark.i) && c.mark.i >= 0 && c.mark.i < n) {
+    const mv = c.series[0].values[c.mark.i];
+    if (mv !== null && Number.isFinite(mv)) {
+      const mx = x(c.mark.i), my = y(mv);
+      svg += `<circle cx="${mx.toFixed(1)}" cy="${my.toFixed(1)}" r="4" fill="${c.series[0].color}" stroke="var(--panel)" stroke-width="1.5"/>`;
+      if (c.mark.label) svg += `<text x="${(mx + 7).toFixed(1)}" y="${(my - 9).toFixed(1)}" dy="0.32em" style="fill:var(--text);font-weight:700">${esc(c.mark.label)}</text>`;
+    }
+  }
+  // 끝점 직접 라벨 (2계열 이상일 때) — 겹치면 위아래로 벌린다
+  if (ends.length > 1) {
+    ends.sort((a, b) => a.yy - b.yy);
+    for (let k = 1; k < ends.length; k++) if (ends[k].yy - ends[k - 1].yy < 13) ends[k].yy = ends[k - 1].yy + 13;
+    ends.forEach((e) => { svg += `<text x="${(e.xx + 6).toFixed(1)}" y="${e.yy.toFixed(1)}" dy="0.32em" style="fill:var(--text);font-weight:700">${esc(e.s.label)}</text>`; });
+  }
+  // 호버 레이어: 십자선 + 계열별 점
+  svg += `<line class="xhair" x1="0" x2="0" y1="${m.t}" y2="${m.t + ih}" visibility="hidden"/>`;
+  c.series.forEach((s, k) => { svg += `<circle class="xdot" data-k="${k}" r="4.5" fill="${s.color}" visibility="hidden"/>`; });
+  svg += `<rect class="hit" x="${m.l}" y="${m.t}" width="${iw}" height="${ih}" tabindex="0" aria-label="그래프 값 탐색 (좌우 화살표)"/>`;
+  svg += `</svg><div class="tip" role="status"></div>`;
+  host.innerHTML = svg;
+
+  const el = host.querySelector("svg");
+  const tip = host.querySelector(".tip");
+  const hair = el.querySelector(".xhair");
+  const dots = Array.from(el.querySelectorAll(".xdot"));
+  const hit = el.querySelector(".hit");
+  let cur = -1;
+  function lineKey(color, dash) {
+    return `<svg width="16" height="8" aria-hidden="true"><line x1="1" y1="4" x2="15" y2="4" stroke="${color}" stroke-width="2" ${dash ? `stroke-dasharray="${dash}"` : ""} stroke-linecap="round"/></svg>`;
+  }
+  function show(i) {
+    cur = Math.max(0, Math.min(n - 1, i));
+    const xx = x(cur);
+    hair.setAttribute("x1", xx); hair.setAttribute("x2", xx); hair.setAttribute("visibility", "visible");
+    dots.forEach((dEl) => {
+      const v = c.series[+dEl.dataset.k].values[cur];
+      if (v === null || !Number.isFinite(v)) { dEl.setAttribute("visibility", "hidden"); return; }
+      dEl.setAttribute("cx", xx); dEl.setAttribute("cy", y(v)); dEl.setAttribute("visibility", "visible");
+    });
+    const info = c.tooltip(cur);
+    tip.innerHTML = `<div class="t-head">${esc(info.head)}</div>` +
+      info.rows.map(([color, dash, val, label]) => `<div class="t-row">${lineKey(color, dash)}<b>${esc(val)}</b><span>${esc(label)}</span></div>`).join("") +
+      (info.foot ? `<div class="t-foot">${esc(info.foot)}</div>` : "");
+    tip.style.display = "block";
+    const scale = el.getBoundingClientRect().width / W || 1;
+    const px = xx * scale;
+    const tw = tip.offsetWidth;
+    const left = px + 14 + tw > host.clientWidth ? px - 14 - tw : px + 14;
+    tip.style.left = Math.max(0, left) + "px";
+    tip.style.top = (m.t * scale + 4) + "px";
+  }
+  function hide() {
+    cur = -1;
+    hair.setAttribute("visibility", "hidden");
+    dots.forEach((dEl) => dEl.setAttribute("visibility", "hidden"));
+    tip.style.display = "none";
+  }
+  el.addEventListener("pointermove", (ev) => {
+    const r = el.getBoundingClientRect();
+    const sx = (ev.clientX - r.left) * (W / r.width);
+    if (sx < m.l - half || sx > m.l + iw + half) { hide(); return; }
+    show(Math.round(((sx - m.l) / iw) * (n - 1)));
+  });
+  el.addEventListener("pointerleave", hide);
+  hit.addEventListener("focus", () => show(cur >= 0 ? cur : n - 1));
+  hit.addEventListener("blur", hide);
+  hit.addEventListener("keydown", (ev) => {
+    if (ev.key === "ArrowLeft") { show((cur < 0 ? n : cur) - 1); ev.preventDefault(); }
+    else if (ev.key === "ArrowRight") { show((cur < 0 ? -1 : cur) + 1); ev.preventDefault(); }
+    else if (ev.key === "Home") { show(0); ev.preventDefault(); }
+    else if (ev.key === "End") { show(n - 1); ev.preventDefault(); }
+  });
+}
+
+/* ===================== 재학습 상태 (/retrain/status) ===================== */
+let retrainTimer = null;
+async function loadRetrainInitial() {
+  try {
+    state.retrain = await api("/retrain/status");
+    state.retrainErr = null;
+  } catch (e) {
+    state.retrainErr = e;
+  }
+  renderRetrain();
+  renderPipelines();
+  if (state.retrain && state.retrain.state === "running") startRetrainPolling();
+}
+function startRetrainPolling() {
+  state.pendingPolls = 0;
+  state.pollErrors = 0;
+  if (!retrainTimer) {
+    state.pollStartedAt = Date.now();   // 진행 중 경과 시간은 브라우저 시계로만 잰다 (서버 시계와 비교하지 않음)
+    retrainTimer = setInterval(pollRetrain, RETRAIN_POLL_MS);
+  }
+  pollRetrain();
+}
+function pollElapsedText() {
+  return state.pollStartedAt ? fmtDuration((Date.now() - state.pollStartedAt) / 1000) : null;
+}
+function stopRetrainPolling() {
+  if (retrainTimer) clearInterval(retrainTimer);
+  retrainTimer = null;
+}
+async function pollRetrain() {
+  const before = retrainView();
+  try {
+    state.retrain = await api("/retrain/status");
+    state.retrainErr = null;
+    state.pollErrors = 0;
+  } catch (e) {
+    state.retrainErr = e;
+    state.pollErrors++;
+  }
+  let after = retrainView();
+  if (after === "pending") {
+    state.pendingPolls++;
+    if (state.pendingPolls >= PENDING_POLL_LIMIT) { state.retrainTimedOut = true; after = retrainView(); }
+  }
+  const active = (after === "running" || after === "pending") && state.pollErrors < 5;
+  if (!active) stopRetrainPolling();
+  renderRetrain();
+  renderPipelines();
+  if ((before === "running" || before === "pending") && (after === "done" || after === "failed")) onRetrainFinished(after);
+}
+function retrainNoticeFor(view) {
+  const r = (state.retrain && state.retrain.result) || {};
+  const dc = state.lastSim ? (state.lastSim.drift_check || {}) : null;
+  if (!dc || !isDriftStatus(dc)) return null;   // 이 화면의 마지막 배치가 일으킨 재학습이 아니다 (CLI·다른 창)
+  if (dc.status === "retrain_running") return { cls: "neutral", text: "앞 배치가 시작한 재학습이 끝남 — 이 배치는 재학습되지 않음" };
+  if (view === "failed") return { cls: "err", text: "재학습 실패 — 기존 champion 유지" };
+  if (isExternalSkip(r)) return { cls: "warn", text: `champion 이 바깥에서 바뀌어(${fmtVer(r.served)} → ${fmtVer(r.champion)}) 재학습 건너뜀` };
+  if (r.promoted) return { cls: "ok", text: `재학습 완료 — ${fmtVer(r.version)} 승격` };
+  return { cls: "warn", text: "재학습 완료 — 게이트 탈락, champion 유지" };
+}
+// 승격·탈락·실패 결과가 다른 카드에도 바로 보이도록 다시 읽는다
+function reloadAfterRetrain() {
+  loadVersions();
+  loadChampion();
+  loadHealth();
+  loadAlerts();
+  loadMetrics();
+}
+function onRetrainFinished(view) {
+  state.retrainNotice = retrainNoticeFor(view);
+  renderSimStatus();
+  reloadAfterRetrain();
+}
+function renderRetrain() {
+  const host = $("#retrain-body");
+  const rs = state.retrain;
+  if (state.retrainErr && !rs) { host.innerHTML = errorHtml("재학습 상태(/retrain/status)", state.retrainErr); return; }
+  if (!rs) { host.innerHTML = `<div class="loading">불러오는 중…</div>`; return; }
+  const view = retrainView();
+  const stateMap = {
+    idle: ["neutral", "대기 (idle)"], running: ["run", "진행 중 (running)"], done: ["ok", "완료 (done)"],
+    failed: ["err", "실패 (failed)"], pending: ["run", "시작 대기"], unknown: ["neutral", String(rs.state || "알 수 없음")],
+  };
+  const [cls, label] = stateMap[view] || stateMap.unknown;
+  const started = parseTs(rs.started_at);
+  const finished = parseTs(rs.finished_at);
+  let elapsedText = started && finished ? fmtDuration((finished - started) / 1000) : "—";
+  if (!finished && (view === "running" || view === "pending") && retrainTimer && pollElapsedText()) {
+    elapsedText = `${pollElapsedText()} 경과 (화면 기준)`;
+  }
+
+  let html = `<div class="champ-head">${pill(cls, label)}${retrainTimer ? `<span class="updated">2초마다 확인 · ${esc(fmtClock(new Date()))}</span>` : ""}</div>`;
+  if (state.retrainErr) html += `<div class="note warn">${icon("warn", 13)} 마지막 확인 실패: ${esc(errText(state.retrainErr))}</div>`;
+  if (state.retrainTimedOut) html += `<div class="note warn">${icon("warn", 13)} 트리거 뒤 30초 동안 새 재학습이 보이지 않아 확인을 멈췄습니다. 서버 로그를 보세요.</div>`;
+  html += kvHtml([
+    ["시작", esc(fmtTsText(rs.started_at, true))],
+    ["종료", esc(fmtTsText(rs.finished_at, true))],
+    ["소요", esc(elapsedText)],
+  ]);
+
+  const r = rs.result;
+  if (r && typeof r === "object" && view !== "pending" && view !== "running") {
+    const ch = num(r.champion_rmse), cg = num(r.challenger_rmse), nv = num(r.naive_rmse);
+    const vals = [ch, cg, nv].filter((v) => v !== null);
+    if (vals.length) {
+      const mx = Math.max.apply(null, vals) * 1.05 || 1;
+      const bar = (name, v, extra) => `<div class="bar-row"><span class="name">${esc(name)}</span><div class="track"><div class="fill ${extra || ""}" style="width:${v === null ? 0 : ((v / mx) * 100).toFixed(1)}%"></div></div><span class="val">${fmtNum(v, 2)}</span></div>`;
+      html += `<div class="champ-block"><div class="block-label">홀드아웃 RMSE 비교${r.holdout_n != null ? ` · ${esc(fmtInt(r.holdout_n))}건` : ""}</div>
+        <div class="bars">${bar("챔피언 (기존)", ch)}${bar("도전자 (fine-tune)", cg, "challenger")}${bar("직전값 (naive)", nv)}</div>
+        ${refSkillHtml(r)}
+        <div class="note">승격 조건: 도전자 &lt; 챔피언 그리고 도전자 ≤ 직전값 그리고 기준 val skill ≥ ${esc(fmtNum(num(cfg("GATE_MIN_SKILL")), 2))} (scratch 배포 게이트와 같은 기준)</div></div>`;
+    }
+    const verdict = isExternalSkip(r) ? pill("warn", `건너뜀 · ${fmtVer(r.champion)} 다시 읽음`)
+      : r.promoted ? pill("ok", `승격 · ${fmtVer(r.version)}`) : (r.promoted === false ? pill("warn", "탈락 · champion 유지") : "");
+    if (verdict || r.reason || r.error) {
+      html += `<div class="champ-block">${verdict}${r.reason ? `<div class="note">${esc(r.reason)}</div>` : ""}${r.error ? `<div class="note warn">${esc(r.error)}</div>` : ""}</div>`;
+    }
+  } else if (typeof r === "string" && r && view !== "pending") {
+    html += `<div class="note">${esc(r)}</div>`;
+  }
+  if (view === "idle" && !state.lastSim) html += `<div class="note">드리프트 시나리오를 보내면 여기서 진행 상황을 볼 수 있습니다.</div>`;
+  host.innerHTML = html;
+}
+
+// 도전자를 scratch 게이트와 같은 기준 세트(학습 CSV 의 val)로 채점한 결과 — 연쇄 승격으로 배포 기준 밑으로 떨어지는 것을 막는다
+function refSkillHtml(r) {
+  const sk = num(r.ref_skill);
+  if (sk === null) return "";
+  const gate = num(cfg("GATE_MIN_SKILL"));
+  const pass = gate === null ? null : sk >= gate;
+  return `<div class="note">${pass === null ? "" : pill(pass ? "ok" : "warn", pass ? "기준 통과" : "기준 미달")}
+    기준 세트 val RMSE ${fmtNum(r.ref_val_rmse, 2)} · 직전값 ${fmtNum(r.ref_naive_val_rmse, 2)} → skill <b>${fmtNum(sk, 3)}</b>${gate === null ? "" : ` ${pass ? "≥" : "&lt;"} ${fmtNum(gate, 2)}`}</div>`;
+}
+
+/* ===================== Datasets ===================== */
 async function uploadFile() {
-  const input = document.getElementById("upload-input");
-  const statusEl = document.getElementById("upload-status");
+  const input = $("#upload-input");
+  const statusEl = $("#upload-status");
   if (!input.files.length) {
-    statusEl.innerHTML = `<span class="pill warn"><span class="dot"></span>파일을 먼저 선택하세요</span>`;
+    statusEl.innerHTML = pill("warn", "CSV 파일을 먼저 선택하세요");
     return;
   }
   const form = new FormData();
   form.append("file", input.files[0]);
-  statusEl.innerHTML = `<span class="pill neutral"><span class="dot"></span>업로드 중…</span>`;
+  const btn = $("#upload-btn");
+  btn.disabled = true;
+  statusEl.innerHTML = pill("run", "업로드 중… (정제·품질 계산 포함)");
   try {
-    const res = await fetch("/data/upload", { method: "POST", body: form });
-    const data = await safeJson(res);
-    if (!res.ok) {
-      statusEl.innerHTML = `<span class="pill err"><span class="dot"></span>${data.detail || "업로드 실패"}</span>`;
-      return;
-    }
-    statusEl.innerHTML = `<span class="pill ok"><span class="dot"></span>업로드 완료: ${data.filename} (${data.rows}행)</span>`;
+    const d = (await api("/data/upload", { method: "POST", body: form })) || {};
+    const q = d.quality || d.quality_report || (d.indices ? d : null);
+    const total = q ? num(q.weighted_total) : null;
+    const cleanRows = d.clean && typeof d.clean === "object" ? d.clean.rows : null;
+    const rowsText = d.rows != null ? ` (원본 ${fmtInt(d.rows)}행${cleanRows != null ? ` · 정제 후 ${fmtInt(cleanRows)}행` : ""})` : "";
+    statusEl.innerHTML = pill("ok", `업로드 완료: ${d.filename || input.files[0].name}${rowsText}`) +
+      (total !== null ? ` <span class="pill neutral">품질 가중 합계 ${esc(fmtNum(total, 1))}%</span>` : "") +
+      `<div class="note">다음 학습(<code>train_and_register</code>)부터 이 파일을 씁니다. 품질 상세는 아래 표를 보세요.</div>` +
+      rawDetails(d, "업로드 응답 보기");
+    loadDataStatus();
   } catch (e) {
-    statusEl.innerHTML = `<span class="pill err"><span class="dot"></span>요청 실패: ${e.message}</span>`;
+    statusEl.innerHTML = errorHtml("CSV 업로드", e, "업로드하지 못했습니다");
+  } finally {
+    btn.disabled = false;
   }
 }
-
-/* ===================== 재학습 로그 ===================== */
-async function loadLogFiles() {
-  const { ok, data } = await getJSON("/logs");
-  const wrap = document.getElementById("log-file-list");
-  if (!ok || !data || !data.length) {
-    wrap.innerHTML = `<span class="pill neutral">아직 로그가 없습니다 - 드리프트 배치를 보내면 logs/aiops.log가 생깁니다</span>`;
+async function loadDataStatus() {
+  const host = $("#data-status-body");
+  const qhost = $("#quality-body");
+  host.classList.add("refreshing");
+  try {
+    const d = (await api("/data/status")) || {};
+    renderDataStatus(d);
+    renderQuality(d.quality || d.quality_report || null);
+  } catch (e) {
+    host.innerHTML = errorHtml("데이터 현황(/data/status)", e);
+    qhost.innerHTML = errorHtml("품질 리포트(/data/status)", e);
+  } finally {
+    host.classList.remove("refreshing");
+  }
+}
+function renderDataStatus(d) {
+  const host = $("#data-status-body");
+  if (d.exists === false) {
+    host.innerHTML = `<div class="empty">학습에 쓸 CSV 가 없습니다. 왼쪽에서 업로드하거나 seed CSV 를 <code>data/seed/</code> 에 두세요.${d.message ? `<br><span style="color:var(--faint)">${esc(d.message)}</span>` : ""}</div>`;
     return;
   }
-  wrap.innerHTML = data.map((f) =>
-    `<button class="btn secondary" onclick="openLogFile('${f.name}')">${f.name} (${f.size}B)</button>`
-  ).join("");
-}
-async function openLogFile(name) {
-  const box = document.getElementById("log-content");
-  const { ok, data } = await getJSON(`/logs/${encodeURIComponent(name)}`);
-  if (!ok || !data) { showResult(box, "불러오기 실패", true); return; }
-  showResult(box, data.content || "(비어 있음)");
-}
+  // /data/status: rows = 원본 행, clean_rows = 정제 후 행, clean = 정제 요약(구간 목록·분할 경계), clean_report = 정제 리포트
+  const summary = (d.clean && typeof d.clean === "object") ? d.clean : {};
+  const report = d.clean_report || d.cleaning || d.report || summary;
+  const cleanRows = firstDef(d.clean_rows, d.rows_clean, summary.rows);
+  const rawRows = cleanRows != null ? firstDef(d.raw_rows, d.rows_raw, d.rows) : firstDef(d.raw_rows, d.rows_raw);
+  const shownRows = cleanRows != null ? cleanRows : d.rows;
+  const start = firstDef(d.start, summary.start);
+  const end = firstDef(d.end, summary.end);
+  const segments = firstDef(d.segments, report.segments, summary.segments);
+  const dup = firstDef(report.dup_days, summary.dup_days, d.dup_days) || [];
+  const dropped = firstDef(report.dropped_rows, summary.dropped_rows, d.dropped_rows);
+  const hum = firstDef(report.humidity_clipped, summary.humidity_clipped, d.humidity_clipped);
+  const file = firstDef(d.filename, d.file, d.path);
+  const source = d.source;
+  const isSeed = source ? /seed/i.test(String(source)) : (file ? /Resource_Management_Process|seed/.test(String(file)) : false);
+  const dupList = Array.isArray(dup) ? dup : [dup];
+  const split = summary.split;
+  const segList = Array.isArray(summary.segment_list) ? summary.segment_list : [];
 
-/* ===================== 파이프라인 시각화 ===================== */
-function renderPipeline() {
-  const track = document.getElementById("pipeline-track");
-  const badge = document.getElementById("pipeline-run-badge");
-
-  if (!lastPipelineRun) {
-    badge.className = "pill neutral"; badge.textContent = "아직 실행 안 함";
-    track.innerHTML = PIPELINE_STAGES.map((s, i) => stageHtml(s, i, "idle", "대기 중")).join("");
+  host.innerHTML = kvHtml([
+    ["출처", `${isSeed ? pill("neutral", "seed CSV") : pill("run", "업로드")} <span style="color:var(--muted);font-family:var(--mono);font-size:0.76rem">${esc(file ? String(file).split(/[\\/]/).pop() : "—")}</span>`],
+    ["행 수 (정제 후)", `<b>${esc(fmtInt(shownRows))}</b>${rawRows != null ? ` <span style="color:var(--muted)">/ 원본 ${esc(fmtInt(rawRows))}</span>` : ""}`],
+    ["기간", esc(start || end ? `${fmtTsText(start)} ~ ${fmtTsText(end)}` : "—")],
+    ["연속 구간", segments != null ? `${esc(fmtInt(segments))}개 <span style="color:var(--muted)">(15분 간격이 끊긴 곳마다 새 구간)</span>` : "—"],
+    ["제외된 날짜", dupList.length ? `<div class="chips">${dupList.map((x) => `<span class="chip">${esc(x)}</span>`).join("")}</div><div class="note" style="margin-top:4px">같은 시각이 두 번 이상 나온 날은 그날 전체를 뺍니다.</div>` : "없음"],
+    ["제외된 행", esc(fmtInt(dropped))],
+    ["습도 음수 → 0", hum != null ? `${esc(fmtInt(hum))}행` : "—"],
+    ["학습 분할 (70/15/15)", split ? `val 시작 ${esc(fmtTsText(split.val_start))}<br>test 시작 ${esc(fmtTsText(split.test_start))}` : "—"],
+  ]) +
+  (segList.length ? `<details class="tbl"><summary>구간 목록 (${segList.length}개)</summary><div class="table-scroll"><table>
+      <thead><tr><th>구간</th><th>시작</th><th>끝</th><th class="num">행</th></tr></thead>
+      <tbody>${segList.map((g) => `<tr><td>${esc(g.seg)}</td><td>${esc(fmtTsText(g.start))}</td><td>${esc(fmtTsText(g.end))}</td><td class="num">${esc(fmtInt(g.rows))}</td></tr>`).join("")}</tbody>
+    </table></div></details>` : "") +
+  rawDetails(d, "/data/status 원본 보기");
+}
+function renderQuality(q) {
+  const host = $("#quality-body");
+  if (!q || typeof q !== "object") {
+    host.innerHTML = `<div class="empty">/data/status 응답에 품질 리포트가 없습니다.</div>`;
     return;
   }
-
-  const { driftCheck, ts } = lastPipelineRun;
-  badge.className = "pill neutral";
-  badge.textContent = `마지막 실행 ${relTime(ts)}`;
-
-  const serverStatus = driftCheck.status; // "ok" | "retrain_triggered"
-  const promoted = driftCheck.promoted;
-
-  let states; // 7개 단계 상태: idle | ok | warn
-  if (serverStatus === "retrain_triggered" && promoted === true) {
-    states = ["ok", "ok", "warn", "ok", "ok", "ok", "ok"];
-  } else if (serverStatus === "retrain_triggered" && promoted === false) {
-    states = ["ok", "ok", "warn", "ok", "ok", "warn", "idle"];
-  } else if (serverStatus === "retrain_triggered") {
-    states = ["ok", "ok", "warn", "idle", "idle", "idle", "idle"];
-  } else {
-    states = ["ok", "ok", "ok", "idle", "idle", "idle", "idle"];
-  }
-  const statusText = { ok: "완료", warn: "감지됨", idle: "대기 중" };
-
-  track.innerHTML = PIPELINE_STAGES.map((s, i) => stageHtml(s, i, states[i], statusText[states[i]])).join("");
-}
-function stageHtml(stage, idx, state, statusLabel) {
-  return `
-    <div class="pipe-stage ${state}">
-      <div class="pipe-title">${stage.title}</div>
-      <div class="pipe-desc">${stage.desc}</div>
-      <div class="pipe-status">${statusLabel}</div>
-    </div>`;
+  const idx = q.indices || q;
+  let sum = 0, wsum = 0;
+  const rows = QUALITY_INDICES.map((qi) => {
+    const v = num(idx[qi.key]);
+    if (v !== null) { sum += v * qi.weight; wsum += qi.weight; }
+    return `<tr>
+      <td style="white-space:nowrap"><b>${esc(qi.name)}</b> <span style="color:var(--faint);font-family:var(--mono);font-size:0.7rem">${esc(qi.key)}</span></td>
+      <td style="color:var(--muted)">${esc(qi.desc)}</td>
+      <td class="num">${qi.weight.toFixed(2)}</td>
+      <td class="num"><b>${v === null ? "해당 없음" : fmtNum(v, 2) + "%"}</b></td>
+      <td style="width:20%"><div class="qbar"><div style="width:${v === null ? 0 : Math.max(0, Math.min(100, v)).toFixed(1)}%"></div></div></td>
+      <td class="num">${v === null ? "—" : fmtNum(v * qi.weight, 2)}</td>
+    </tr>`;
+  }).join("");
+  const total = num(q.weighted_total);
+  const issues = Array.isArray(q.issues) ? q.issues : [];
+  host.innerHTML = `
+    <table>
+      <thead><tr><th>지수</th><th>정의</th><th class="num">가중치</th><th class="num">값</th><th></th><th class="num">기여 (값×가중치)</th></tr></thead>
+      <tbody>${rows}
+        <tr class="total"><td colspan="3">가중 합계</td><td class="num">${total === null ? "—" : fmtNum(total, 2) + "%"}</td><td></td><td class="num">${wsum ? fmtNum(sum, 2) : "—"}</td></tr>
+      </tbody>
+    </table>
+    ${wsum && total !== null && Math.abs(sum - total) > 0.05 ? `<div class="note">서버 합계와 화면 검산(Σ 값×가중치)이 다릅니다 — 해당 없는 지수가 있으면 서버가 가중치를 다시 나눴을 수 있습니다.</div>` : ""}
+    ${issues.length ? `<div class="block-label" style="margin-top:14px">발견된 문제</div><ul class="issues">${issues.map((s) => `<li>${esc(s)}</li>`).join("")}</ul>` : `<div class="note">발견된 문제가 없습니다.</div>`}`;
 }
 
-/* ===================== 드리프트 배치 전송 ===================== */
-async function sendBatch(kind) {
-  const statusEl = document.getElementById("drift-status");
-  const resultBox = document.getElementById("drift-result");
-  const n = SEQ_LEN + WINDOW_SIZE;
-  const sigma = kind === "drift" ? DRIFT_SIGMA : NORMAL_SIGMA;
-  const prices = randomWalk(n, DEFAULT_BASE_PRICE, sigma);
+/* ===================== System: 엔드포인트 목록 ===================== */
+function renderEndpoints() {
+  const rows = ENDPOINTS.map(([method, path, role]) => {
+    const linkable = method === "GET" && !path.includes("{");
+    return `<tr><td><span class="method ${method}">${method}</span></td>
+      <td class="path">${linkable ? `<a href="${esc(path)}" target="_blank" rel="noopener">${esc(path)}</a>` : esc(path)}</td>
+      <td style="color:var(--muted)">${esc(role)}</td></tr>`;
+  }).join("");
+  $("#endpoints-body").innerHTML = `<table><thead><tr><th style="width:80px">Method</th><th>URL</th><th>역할</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
 
-  statusEl.innerHTML = `<span class="pill warn"><span class="dot"></span>전송 중… (fine-tuning이 걸리면 수십 초 걸릴 수 있습니다)</span>`;
-
+/* ===================== 초기화 · 이벤트 ===================== */
+function bindEvents() {
+  window.addEventListener("hashchange", showTab);
+  $("#metrics-window").addEventListener("click", (ev) => {
+    const b = ev.target.closest("button[data-win]");
+    if (!b) return;
+    state.metricsWindow = b.dataset.win;
+    $$("#metrics-window button").forEach((x) => x.classList.toggle("on", x === b));
+    loadMetrics();
+  });
+  $("#scenario-list").addEventListener("click", (ev) => {
+    const b = ev.target.closest(".scn");
+    if (b && !b.disabled) runScenario(b.dataset.scenario);
+  });
+  $("#upload-btn").addEventListener("click", uploadFile);
+  document.addEventListener("click", (ev) => {
+    const b = ev.target.closest("[data-action]");
+    if (!b) return;
+    const a = b.dataset.action;
+    if (a === "reload-registry") { loadVersions(); loadChampion(); }
+    else if (a === "reload-alerts") loadAlerts();
+    else if (a === "reload-data") loadDataStatus();
+    else if (a === "reload-health") loadHealth();
+  });
+  let rt = null;
+  window.addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(renderSimCharts, 150); });
+}
+// 재학습이 이 화면 밖(다른 터미널의 simulate_drift.py · 다른 창)에서 일어나도 카드들이 서로 어긋나지 않게
+// /retrain/status 를 30초마다 한 번 읽는다 (요청 1개). /registry/* 는 MLflow 조회라 무조건 읽지 않고 바뀌었을 때만.
+async function refreshRetrainStatus() {
+  if (retrainTimer) return;   // 2초 폴링 중이면 그쪽이 맡는다
+  const prev = state.retrain;
   try {
-    const res = await fetch("/predict/batch-test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prices }) });
-    const data = await safeJson(res);
-    if (!res.ok) {
-      const reason = data.__raw
-        ? "서버 오류 - model_loader.py 또는 predict.py의 TODO가 아직 구현되지 않았을 수 있습니다"
-        : "오류 (TODO 미구현일 수 있음)";
-      statusEl.innerHTML = `<span class="pill err"><span class="dot"></span>${reason}</span>`;
-      showResult(resultBox, { status: res.status, detail: data }, true);
-      return;
-    }
-    const actual = [];
-    for (let i = 0; i < prices.length - SEQ_LEN; i++) actual.push(prices[i + SEQ_LEN]);
-    const clientRmse = rmseOf(actual, data.predictions || []);
-
-    lastPipelineRun = { driftCheck: data.drift_check || {}, clientRmse, ts: Date.now() / 1000 };
-    renderPipeline();
-    loadLogFiles();
-
-    const check = data.drift_check || {};
-    let level = "ok", label = "정상 (드리프트 없음)";
-    if (check.status === "retrain_triggered" && check.promoted) {
-      level = "ok"; label = `재학습 완료 · 새 버전 승격 (rmse=${check.rmse?.toFixed?.(2) ?? check.rmse})`;
-    } else if (check.status === "retrain_triggered" && check.promoted === false) {
-      level = "warn"; label = `드리프트 감지 · 재학습했지만 게이트 미통과 (rmse=${check.rmse?.toFixed?.(2) ?? check.rmse})`;
-    } else if (check.status === "retrain_triggered") {
-      level = "warn"; label = "드리프트 감지 · 재학습 트리거됨";
-    }
-    statusEl.innerHTML = `
-      <span class="pill ${level}"><span class="dot"></span>${label}</span>
-      <span class="pill neutral" style="margin-left:6px;">클라이언트 계산 RMSE: $${clientRmse != null ? clientRmse.toFixed(2) : "-"}</span>`;
-    showResult(resultBox, data, false);
+    state.retrain = await api("/retrain/status");
+    state.retrainErr = null;
   } catch (e) {
-    statusEl.innerHTML = `<span class="pill err"><span class="dot"></span>연결 실패</span>`;
-    showResult(resultBox, "요청 실패: " + e.message, true);
+    state.retrainErr = e;
+    renderRetrain();
+    renderPipelines();
+    return;
   }
+  const rs = state.retrain || {};
+  if (rs.state === "running") { startRetrainPolling(); return; }   // 끝나면 onRetrainFinished 가 카드를 다시 읽는다
+  renderRetrain();
+  renderPipelines();
+  // fine-tune 은 6초 남짓이라 30초 주기 사이에 시작해서 끝나 버릴 수 있다 → finished_at 이 바뀌었으면 다시 읽는다
+  const finishedChanged = !!prev && (prev.state !== rs.state || prev.finished_at !== rs.finished_at);
+  if (finishedChanged && (rs.state === "done" || rs.state === "failed")) { loadVersions(); loadChampion(); }
 }
-
-/* ===================== 초기화 ===================== */
-async function init() {
-  renderPipeline();
-  loadLogFiles();
+function autoRefresh() {
+  if (document.hidden) return;
+  loadHealth();
+  refreshRetrainStatus();
+  if (currentTab() === "dashboard") { loadMetrics(); loadAlerts(); }
+  else if (currentTab() === "simulation") loadAlerts();
+  renderPipelines();   // 「n초 전」 문구 갱신
+}
+function init() {
+  if (location.protocol === "file:") $("#file-banner").hidden = false;
+  tickClock();
+  setInterval(tickClock, 1000);
+  renderEndpoints();
+  renderPipelines();
+  bindEvents();
+  showTab();
+  loadConfig();
+  loadHealth();
+  loadMetrics();
+  loadVersions();
+  loadChampion();
+  loadAlerts();
+  loadScenarios();
+  loadRetrainInitial();
+  loadDataStatus();
+  setInterval(autoRefresh, AUTO_REFRESH_MS);
 }
 init();
 </script>

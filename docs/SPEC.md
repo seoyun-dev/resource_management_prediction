@@ -19,8 +19,11 @@ Python: `.venv/bin/python` (3.11, TF 2.21, MLflow 3.16, FastAPI 0.141, pandas 3.
 | 입력 길이 | `SEQ_LEN = 20` (5시간) | 8~96 차이 없음 |
 | 모델 | LSTM 32→32→16 + Dense16(relu) → Dense1, MSE, Adam **lr 3e-3** | 학습률 3e-3 이 1e-3 보다 낫다(z −2.0~−2.44) |
 | 학습 | batch 64, max epochs 200, EarlyStopping(val_loss, patience 10, restore_best_weights), seed 42 | 고정 epoch 은 상한에 걸려 덜 배웠다 |
-| 결정론 | `keras.utils.set_random_seed(42)` + `tf.config.experimental.enable_op_determinism()` | 같은 데이터면 같은 결과 |
+| 결정론 | `keras.utils.set_random_seed(42)` + `tf.config.experimental.enable_op_determinism()` | 같은 기기·같은 플랫폼(OS·CPU)에서 같은 데이터면 같은 결과. 플랫폼이 다르면 가중치가 달라진다 — 맥 val 10.90 / test 11.48 / 38/48, Docker(Linux) val 10.69 / test 10.92 / 47/57 |
 | 성능 참고 | val RMSE ≈ 10.9, test ≈ 11.4 · 직전값 val 18.62 / test 19.04 | |
+
+통합 실측(2026-10-01, 이 코드로 전체 학습): LSTM val **10.90** / test **11.48**, best_epoch 38/48. 직전값은 val 19.12 / test 19.12 —
+서빙 코드는 구간 안에 SEQ_LEN(20칸) 맥락만 있으면 채점해서(실험은 96칸) 시점이 더 많다. pos ≥ 96 으로 거르면 18.62 / 19.04 가 그대로 나온다.
 
 ## 1. 데이터 — `data/features.py` (학습·서빙·재학습 공용, 정본)
 
@@ -75,15 +78,26 @@ def quality_report(raw_df) -> dict   # {"indices": {"completeness": %, "uniquene
 SCENARIOS = {
   "normal":          "정상 — test 구간 실제 데이터를 그대로 재생",
   "new_product":     "신규 피도금체 투입 — 표면적이 큰 제품이 들어와 조업 시간(08~18시) 전력 지표가 1.35배",
-  "equipment_fault": "설비 이상 — 정류기 효율 저하로 전 시간대 +40 수준 이동 + 변동(σ 12) 증가",
-  "schedule_shift":  "조업 시간 변경 — 교대가 2시간 앞당겨져 하루 패턴이 8칸 이동",
+  "equipment_fault": "설비 이상 — 정류기 효율 저하로 전 시간대 +40 수준 이동 + 변동(σ 20) 증가",
+  "schedule_shift":  "조업 시간 변경 — 교대가 4시간 앞당겨져(07시 기동 → 03시) 하루 패턴이 16칸 이동",
 }
 def make_batch(scenario, n_targets=96, seed=0, df=None) -> list[dict]
     # 반환: [{"timestamp": "YYYY-MM-DDTHH:MM:SS", "power_usage": float}] 길이 SEQ_LEN + n_targets, 15분 연속
     # df 기본값 = seed CSV 정제본. 시작점은 test 구간의 연속 구간 안에서 seed 로 고른다
+    #   단, 판정 창(배치 마지막 21칸)이 11:00~12:59 에 끝나고 창 안 실제값이 모두 100 이상(가동 중)인 곳만
     # 변형은 앞 SEQ_LEN 칸(과거 맥락)에는 적용하지 않고 뒤 n_targets 칸에만 적용 (변화가 "지금부터" 시작)
 ```
 크기(1.35, +40/σ12, 8칸)는 통합 단계에서 **정상 배치 21건창 RMSE < 25, 드리프트 배치 > 25** 가 되도록 보정하고 근거를 docstring 에 숫자로 남긴다.
+
+**보정 결과 (통합 단계, 2026-10-01 — 근거 숫자는 `data/simulate.py` docstring 「보정」. 맥북에서 학습한 champion v1 · `n_targets=96` 기준)**
+- 시작점 규칙 추가: 판정 창이 밤·휴무일에 걸리면 new_product(08~18시만 변형)·schedule_shift(모양만 변형)는 창 안에 바뀐 것이 없다
+- equipment_fault σ 12 → **20** (+40 은 그대로): σ 12 는 후보 창의 7% 가 25 밑. σ 20 은 99%
+- schedule_shift 8칸 → **16칸(4시간)**: 2시간 이동은 LSTM 이 입력 창으로 따라가 >25 가 14% 뿐 — 이 모델에겐 드리프트가 아니다
+- new_product 1.35 는 그대로
+- seed 0~9 실측 (맥 champion 기준): normal 10/10 < 25 · new_product 10/10 · equipment_fault 10/10 · schedule_shift 9/10 > 25
+- schedule_shift 는 champion 에 민감하다. Docker(Linux)에서 학습한 champion 으로는 seed 0~9 중 8/10 (seed 7 = 16.8, seed 9 = 22.7),
+  seed 0~29 중 16/30, 후보 창 전체 53.2%, 중앙값 25.4. 윈도우 champion 은 미측정. 발표 데모의 드리프트 시연은 equipment_fault·new_product 로 한다
+- 다른 `n_targets` 에서는 다시 재지 않았다 (판정 창이 같은 21칸이어도 잡음·변형 구간 길이가 달라진다)
 
 ## 3. 학습·등록 — `serving_app/lstm_model.py`, `serving_app/train_and_register.py`, `scripts/train_baseline_v1.py`
 
@@ -106,13 +120,23 @@ def train_and_register(csv_path=None) -> dict
 def fine_tune(points_df) -> dict
     # 최근 관측 데이터(frame_from_points 결과)로 champion 가중치에서 warm start
     # 시퀀스를 시간순 80/20 → 80 으로 FT_EPOCHS 학습, 20 홀드아웃에서 챔피언·도전자·직전값 RMSE 를 같은 시점으로 비교
+    # 도전자를 기준 세트(lm.training_csv() 를 load_clean → prepare_splits 한 val = scratch 게이트와 같은 세트)로도 채점
     # 승격 조건(챔피언/도전자): challenger_rmse < champion_rmse AND challenger_rmse <= naive_rmse
-    # MLflow run "fine-tune": params(mode=fine-tune, n_rows, holdout_n), metrics(challenger_rmse, champion_rmse, naive_rmse)
-    # 반환 {"run_id","challenger_rmse","champion_rmse","naive_rmse","holdout_n","promoted","version"|None,"reason"}
-def list_versions() -> list[dict]       # registry 표용: version, created_at(ISO), mode, rmse(val_rmse 또는 challenger_rmse), aliases, run_id
+    #                           AND ref_skill(기준 세트 val 의 1 − rmse/직전값) >= GATE_MIN_SKILL
+    #   근거: 모든 champion 은 scratch 게이트와 같은 기준을 만족한다. v9 는 4회 연쇄 승격으로 val skill 0.157 이었는데 서빙됐다
+    #         (첫 승격 v2 는 0.280 으로 통과)
+    # MLflow run "fine-tune": params(mode=fine-tune, n_rows, holdout_n, ref_data_file),
+    #   metrics(challenger_rmse, champion_rmse, naive_rmse, ref_val_rmse, ref_naive_val_rmse, ref_skill_vs_naive)
+    # 반환 {"run_id","challenger_rmse","champion_rmse","naive_rmse","holdout_n","promoted","version"|None,"reason",
+    #       "ref_val_rmse","ref_naive_val_rmse","ref_skill"}
+def ft_decision(challenger_rmse, champion_rmse, naive_rmse, ref_skill=None) -> tuple[bool, str]
+    # 위 승격 조건. ref_skill=None 이면 셋째 조건을 보지 않는다 (3인자 호출 호환). 사유는 print 되므로 '—' 대신 '-'
+def list_versions() -> list[dict]       # registry 표용: version, created_at(ISO), mode, rmse(val_rmse 또는 challenger_rmse), aliases, run_id, retired_at(지금 champion 이면 None)
 def champion_info() -> dict | None
 ```
 MLflow 저장소: 프로젝트 루트 `sqlite:///mlflow.db` (환경변수 `MLFLOW_TRACKING_URI` 가 있으면 그것). 아티팩트는 `mlruns/`.
+아티팩트 위치는 `mlflow.db` 안에 **절대 경로**로 들어간다 → `mlflow.db`·`mlruns/` 는 기기·폴더 사이로 옮기지 않는다 (각자 baseline → train_and_register 로 다시 만든다).
+skill 은 직전값 RMSE 가 0 이면(값이 변하지 않는 데이터) NaN — 게이트에서 막힌다.
 
 ## 4. 서빙 — `serving_app/`
 
@@ -145,24 +169,33 @@ TF 첫 import 가 로드 시간의 대부분이다(실측 2.36s / load_model 0.0
 | POST | `/simulate/{scenario}?seed=&n_targets=` | 서버가 `data/simulate.make_batch` 로 배치를 만들어 batch-test 와 같은 처리. 응답 = BatchTestResponse + `scenario`, `description` |
 | GET | `/simulate/scenarios` | 시나리오 목록·설명 |
 | GET | `/retrain/status` | `{"state": "idle"\|"running"\|"done"\|"failed", "started_at", "finished_at", "result"}` |
-| GET | `/health` | status, model_loaded, loading_mode, model_source, model_version |
-| POST | `/data/upload` | CSV 업로드 (필수 컬럼 Datetime, Power_Usage; 최소 41행) → 저장 + 품질 리포트 반환 |
+| GET | `/health` | status(`ok` \| `degraded` = Eager 인데 모델이 캐시에 없음), model_loaded, loading_mode, model_source, model_version |
+| POST | `/data/upload` | CSV 업로드 (필수 컬럼 Datetime, Power_Usage; 최소 41행; Power_Usage > 0 인 행 41행 이상; 값이 하나로 고정되지 않음) → 저장 + 품질 리포트 반환 |
 | GET | `/data/status` | 최신 업로드(없으면 seed) 행수·기간·구간·정제 리포트·품질 리포트 |
 | GET | `/metrics/summary?window=5m\|1h\|6h\|24h` | requests.log 집계: total, errors, error_rate, p50_ms, p95_ms, by_path |
 | GET | `/registry/versions` | `list_versions()` |
 | GET | `/registry/champion` | `champion_info()` |
 | GET | `/logs` · `/logs/{name}` | 스켈레톤 그대로 (경로 탈출 방지 유지) |
-| GET | `/logs/alerts?limit=20` | aiops.log 를 `[{"ts","level","message"}]` 로 (최신 먼저) |
+| GET | `/logs/alerts?limit=20` | aiops.log 를 `[{"ts","level","tag","message"}]` 로 (최신 먼저). `tag` = 메시지 머리 `WARN`\|`INFO`\|`OK`\|`FAIL`\|`ERROR` — `[OK]`·`[FAIL]` 은 logging 수준으로는 INFO·WARNING 이라 대시보드는 tag 로 색을 가른다 |
 | GET | `/config` | 대시보드 System 탭용: SEQ_LEN, FEATURES, DRIFT_WINDOW, DRIFT_THRESHOLD, GATE_MIN_SKILL, MODEL_NAME, ALIAS, 버전 정보 |
 | GET | `/` | 대시보드(static) — **마지막에 mount** |
 
+없는 경로는 404, 경로는 있는데 메서드가 다르면 405(+`Allow`) — 둘 다 `{"detail": "한국어 문장"}` (`/` 마운트 때문에 Starlette 기본값은 영어 404 라 main.py 가 바로잡는다).
+
 ### 4-5. 모니터링 `serving_app/monitoring/`
 - `drift_detector.py`: `compute_rmse(pairs)`, `is_drift(pairs) -> (bool, rmse|None)` (DRIFT_WINDOW 미만이면 판단 보류)
-- `state.py`: 프로세스 내 상태 — `recent_predictions`(최근 DRIFT_WINDOW 쌍), `obs_buffer`(최근 OBS_BUFFER 행, timestamp 기준 중복 제거·정렬), `retrain_status`, `threading.Lock`
+- `state.py`: 프로세스 내 상태 — `recent_predictions`(최근 DRIFT_WINDOW 쌍), `obs_buffer`(최근 OBS_BUFFER 행, timestamp 기준 중복 제거·정렬. 새 배치가 버퍼의 마지막 시각보다 앞에서 끝나면 — 과거 기간을 재생한 시뮬레이션 — 그 배치로 새로 시작), `retrain_status`, `threading.Lock`
 - `retrain_trigger.py`: `check_and_trigger(background_tasks) -> dict`
   - 드리프트 아님 → `{"status": "ok", "rmse": ...}`
-  - 드리프트 → `aiops` 로거 `[WARN] drift detected - rmse=.. > 25.0` → 이미 running 이면 `{"status": "retrain_running"}` → 아니면 `[INFO] retrain triggered (window=last_N_rows)` 기록 후 백그라운드 `run_retrain()` 예약, `{"status": "retrain_triggered", "rmse": ...}` 즉시 반환
-  - `run_retrain()`: `fine_tune(obs_buffer)` → 승격이면 `[OK] new_rmse=.. - champion promoted: Surface_Power_Predictor v..` + `model_loader.invalidate()` + **`recent_predictions` 비우기**; 탈락이면 `[FAIL] challenger rmse=.. >= champion rmse=.. - champion kept` ; 예외면 `[ERROR] ...` + state failed
+  - 드리프트 → `aiops` 로거 `[WARN] drift detected - rmse=.. > 25.0` → 이미 running 이면 `{"status": "retrain_running"}` → 아니면 `[INFO] retrain triggered (window=last_N_rows)` 기록 후 백그라운드 `run_retrain()` 시작(데몬 스레드 — FastAPI BackgroundTasks 는 클라이언트가 응답 전에 끊으면 실행되지 않아 상태가 running 에 갇힌다. 인자 `background_tasks` 는 시그니처 호환용), `{"status": "retrain_triggered", "rmse": ...}` 즉시 반환
+  - `run_retrain()`: (먼저) `MODEL_SOURCE=mlflow` 이고 서빙 캐시 버전 ≠ Registry @champion 이면 — 서버 밖에서 alias 가 옮겨짐(train_and_register.py · MLflow UI) —
+    `[WARN] champion 이 바깥에서 바뀜 vA→vB - 서빙 모델을 다시 읽고 이번 재학습은 건너뜀` + `invalidate()`(eager 면 다시 로드) + `state.promote()` 후
+    state done `{"promoted": false, "reason", "served", "champion"}`. 드리프트 판정 자체가 옛 모델의 오차라 새 champion 에겐 근거가 없다.
+    그다음 `fine_tune(obs_buffer)` → 승격이면 `[OK] new_rmse=.. - champion promoted: Surface_Power_Predictor v..` + `model_loader.invalidate()` + **`recent_predictions` 비우기**;
+    탈락이면 사유에 따라 셋 중 하나
+    `[FAIL] challenger rmse=.. >= champion rmse=.. - champion kept` · `[FAIL] challenger rmse=.. > naive rmse=.. - champion kept` ·
+    `[FAIL] challenger ref skill=0.157 < gate 0.20 - champion kept` (그 밖은 `[FAIL] challenger not promoted (<reason>) - champion kept`);
+    예외면 `[ERROR] retrain failed - <예외>` + state failed
   - 데모·스켈레톤의 함정 세 가지를 고친 것이다: 승격 후 캐시가 옛 모델(부록 6) / 재학습 직후 재오탐(부록 7) / 재학습이 요청을 붙잡음(부록 8)
 - `request_log.py`: FastAPI 미들웨어 — `/static`·`/` 를 뺀 모든 요청을 `logs/requests.log` 에 JSON 한 줄 `{"ts","method","path","status","ms"}`; `summarize(window) -> dict`
 
@@ -179,8 +212,9 @@ TF 첫 import 가 로드 시간의 대부분이다(실측 2.36s / load_model 0.0
 ## 6. 운영 파일
 
 - `scripts/simulate_drift.py`: CLI — `--scenario {normal,new_product,equipment_fault,schedule_shift} --seed --url http://localhost:8000` → `/predict/batch-test` 로 전송, drift_check 출력
-- `scripts/e2e_check.py`: 살아 있는 서버를 대상으로 전체 루프 점검(health → predict 200/422 → normal ok → drift 시나리오 retrain_triggered → status done → champion 버전 바뀜 → /predict model_version 바뀜 → 알람 WARN→INFO→OK 순서)
-- `serving_app/Dockerfile`/`docker-compose.yml`: 빌드 시 `data/seed/*.csv` → `data/uploads/build_seed.csv` → baseline → train_and_register, `MODEL_SOURCE=mlflow`, `LOADING_MODE=eager`, 8000
+- CLI 세 개(`simulate_drift.py`·`e2e_check.py`·`train_baseline_v1.py`)는 `main()` 첫 줄에서 `sys.stdout.reconfigure(errors="replace")` — 한국어 Windows 에서 파이프·리디렉션이면 stdout 이 cp949 라 `—` 에서 죽는다. 서버 쪽 print 문자열에는 `—` 를 쓰지 않는다
+- `scripts/e2e_check.py`: 살아 있는 서버를 대상으로 전체 루프 점검(health → predict 200/422 → normal ok → drift 시나리오 retrain_triggered → status done → champion 버전 바뀜 → /predict model_version 바뀜 → 알람 WARN→INFO→OK 순서 → 승격 뒤 정상 배치 ok(재경보 없음))
+- `serving_app/Dockerfile`/`docker-compose.yml`: 빌드 시 `data/seed/*.csv` → `data/uploads/build_seed.csv` → baseline → train_and_register, `MODEL_SOURCE=mlflow`, `LOADING_MODE=eager`, 8000. compose healthcheck 는 `/health` 의 `status == "ok"` 를 본다
 - `README.md`: 실행 순서(로컬·Docker), 설계 결정 요약(§0), 데모 대비 개선점
 - `docs/API.md`: 기획서 ⑤ API 명세 — 엔드포인트별 Request/Response 예시와 422·500 예시 (실제 호출 결과로 채움)
 
@@ -196,6 +230,6 @@ TF 첫 import 가 로드 시간의 대부분이다(실측 2.36s / load_model 0.0
 
 ## 8. 하지 말 것
 
-- `data/seed/*.csv`·가이드북 PDF 를 git 에 넣지 않는다 (공개 재배포 가능 여부 미확인, 가이드북에 개인 ID)
+- `data/seed/*.csv`·가이드북 PDF 를 git 에 넣지 않는다 (공개 재배포 가능 여부 미확인, 가이드북에 개인 ID). `.gitignore`·`.dockerignore` 에 `*.pdf`·`.DS_Store`
 - 원격 저장소에 push 하지 않는다 (사람이 결정)
 - `../실험/` 폴더는 읽기만 한다
