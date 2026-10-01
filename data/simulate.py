@@ -80,7 +80,7 @@
       (σ 12 일 때) fine-tune lr 을 3e-4 · 1e-3 로 올리면 세 시나리오 합계 승격 16/30 이지만 승격 후 정상 배치
       재경보가 4·7건으로 늘었다(lr 1e-4 는 승격 10/30 · 재경보 1건) → SPEC 값(lr 1e-4 · 10 epoch)을 유지했다.
       σ 20 적용 후 lr 1e-4 로 승격 13/30 · 재경보 2건.
-    측정 스크립트(일회용, git 밖): [맥북] 세션 scratchpad serving_wf/calib_ft.py · calib_grid_min.py · calib_range.py
+    측정에 쓴 일회용 스크립트는 저장소에 넣지 않았다 (위 숫자는 champion 모델로 오프라인 측정한 값)
 
 확인 방법
     .venv/bin/python -c "from data.simulate import make_batch; b = make_batch('equipment_fault', seed=1); \\
