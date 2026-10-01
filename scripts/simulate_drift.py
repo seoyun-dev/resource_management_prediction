@@ -1,87 +1,153 @@
 """
-Day3 드리프트 감지 시뮬레이션 (119~123번 슬라이드).
+Day3 드리프트 시뮬레이션 CLI — 업무 규칙으로 만든 배치를 서버의 /predict/batch-test 로 보낸다.
 
-핵심 프로세스:
-    1) 기준 통계 산출   - 학습에 쓴 3년치 HAIC 데이터의 평균·표준편차 계산
-    2) 정상 입력 테스트 - 같은 분포의 데이터로 예측 -> RMSE $4 이내 확인 (베이스라인)
-    3) 드리프트 데이터 생성 - 변동성을 인위적으로 3배 키운 가격 데이터 생성
-    4) 드리프트 데이터 주입 - 생성한 데이터를 서빙 서버에 연속 요청으로 전송
-    5) 결과 관찰       - RMSE 상승 -> 알림 로그 발생 -> 재학습 트리거 확인
+하는 일:
+    data/simulate.make_batch(scenario, n_targets, seed) 로 SEQ_LEN(20) + n_targets 칸짜리
+    15분 연속 배치를 만들고, 살아 있는 서버의 POST /predict/batch-test 에 {"rows": [...]} 로 보낸다.
+    응답의 drift_check 를 그대로 출력하고, 배치 전체 RMSE 를 참고값으로 같이 찍는다.
+    --wait 를 주면 재학습이 시작된 경우 /retrain/status 를 끝날 때까지 폴링한다.
 
-사전 준비: uvicorn serving_app.main:app 서버가 이미 떠 있어야 합니다.
-실행: python scripts/simulate_drift.py
+왜:
+    스켈레톤은 평균 주변 랜덤워크(변동성 3배)로 드리프트를 흉내 냈다. 전력 지표는 하루 주기가 강해서
+    랜덤워크로는 "정상" 입력조차 모델이 못 맞춰 오탐이 난다. 그래서 정상 배치는 test 구간의 실제
+    데이터를 그대로 재생하고, 드리프트는 현장에서 일어날 법한 업무 규칙(신규 피도금체 투입 · 설비 이상 ·
+    조업 시간 변경)으로 변형한다. 변형 크기와 그 근거 숫자는 data/simulate.py docstring 에 있다.
+
+    n_targets 기본 96(하루치)이면 한 배치의 예측만으로 서버의 21건 윈도우(DRIFT_WINDOW)가 다 찬다.
+    → 이전 요청의 잔여 예측과 섞이지 않고 이 시나리오 하나로 판정된다.
+    batch-test 는 최소 SEQ_LEN + DRIFT_WINDOW = 41행을 요구하므로 n_targets 는 21 이상이어야 한다.
+
+    판정은 서버가 한다(최근 21건 이동 RMSE > 25). 여기서 찍는 "배치 전체 RMSE" 는 96건 전체 값이라
+    서버 판정값과 다를 수 있다 — 참고용이다.
+
+확인 방법:
+    # 서버를 먼저 띄운다 (프로젝트 루트에서)
+    MODEL_SOURCE=mlflow uvicorn serving_app.main:app --port 8000
+
+    python scripts/simulate_drift.py --scenario normal                 # drift_check.status = ok
+    python scripts/simulate_drift.py --scenario equipment_fault        # retrain_triggered
+    python scripts/simulate_drift.py --scenario equipment_fault --wait # 재학습 끝까지 기다림
+    # logs/aiops.log 에 [WARN] drift detected → [INFO] retrain triggered → [OK] | [FAIL] 순서로 남는다
 """
+import argparse
+import json
+import math
 import os
 import sys
+import time
 
-import numpy as np
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.features import load_rows
-from data.storage import latest_upload
 
-API_URL = "http://localhost:8000/predict/batch-test"
+from data.features import SEQ_LEN
+from data.simulate import SCENARIOS, make_batch
+from serving_app.config import DRIFT_THRESHOLD, DRIFT_WINDOW
 
-
-def compute_baseline_stats(csv_path: str | None = None) -> tuple[float, float]:
-    """1단계: 학습에 사용한 데이터(업로드된 최신 CSV)의 평균·표준편차."""
-    rows = load_rows(csv_path or latest_upload())
-    closes = np.array([r["Close"] for r in rows])
-    return float(closes.mean()), float(closes.std())
+DEFAULT_URL = "http://localhost:8000"
+REQUEST_TIMEOUT = 120   # 초. Lazy 모드 첫 요청은 TF import + 모델 로드가 붙는다
+POLL_INTERVAL = 2.0     # 초. 대시보드 폴링과 같은 주기
 
 
-# SEQ_LEN(20) + WINDOW_SIZE(21) = 41개를 보내야 배치 하나당 정확히 WINDOW_SIZE(21)개의
-# (predicted, actual) 쌍이 쌓여, drift_detector.py가 바로 판정할 수 있다.
-BATCH_N = 41
-
-# 학습 데이터(실제 IBM 시세 기반)는 추세·모멘텀이 있는 시계열이라, 평균 주변의 순수
-# 백색잡음(iid noise)을 넣으면 "정상" 입력조차 모델이 못 맞춰 오탐(false positive)이
-# 납니다. 그래서 정상/드리프트 배치 모두 일별 수익률(log return) 기반의 랜덤워크로
-# 만들고, 그 수익률의 표준편차(변동성)만 다르게 줍니다.
-NORMAL_SIGMA = 0.012  # 학습 데이터의 안정적 구간과 비슷한 일별 변동성 (~1.2%)
-DRIFT_SIGMA = NORMAL_SIGMA * 3  # 변동성을 3배 키운 드리프트
+def _fail(msg: str) -> None:
+    sys.stdout.flush()  # 앞 단계 출력이 오류 문구보다 먼저 보이게
+    print(msg, file=sys.stderr)
+    sys.exit(1)
 
 
-def _random_walk(n: int, base: float, sigma: float) -> np.ndarray:
-    log_returns = np.random.normal(0, sigma, n)
-    return base * np.exp(np.cumsum(log_returns))
+def send_batch(rows: list[dict], url: str = DEFAULT_URL) -> dict:
+    """배치를 /predict/batch-test 로 보내고 응답 JSON 을 돌려준다. 실패하면 이유를 찍고 종료."""
+    endpoint = f"{url.rstrip('/')}/predict/batch-test"
+    try:
+        resp = requests.post(endpoint, json={"rows": rows}, timeout=REQUEST_TIMEOUT)
+    except requests.ConnectionError:
+        _fail(
+            f"[연결 실패] {url} 에 서버가 없습니다.\n"
+            f"  먼저 프로젝트 루트에서 서버를 띄우세요: uvicorn serving_app.main:app --port 8000\n"
+            f"  다른 포트로 띄웠다면 --url 로 맞추세요 (실습가이드 부록 1 의 1번)."
+        )
+    if resp.status_code != 200:
+        try:
+            detail = json.dumps(resp.json(), ensure_ascii=False, indent=2)
+        except ValueError:
+            detail = resp.text
+        _fail(f"[요청 실패] HTTP {resp.status_code} {endpoint}\n{detail}")
+    return resp.json()
 
 
-def generate_normal_batch(n=BATCH_N, base=165.0, sigma=NORMAL_SIGMA):
-    """학습 데이터와 비슷한 변동성의 정상 입력(랜덤워크)."""
-    return _random_walk(n, base, sigma)
+def batch_rmse(predictions: list[dict]) -> float | None:
+    """배치 전체 (predicted, actual) RMSE. 서버 판정(최근 21건)과는 다른 참고값."""
+    pairs = [(p["predicted"], p["actual"]) for p in predictions
+             if p.get("predicted") is not None and p.get("actual") is not None]
+    if not pairs:
+        return None
+    return math.sqrt(sum((a - b) ** 2 for a, b in pairs) / len(pairs))
 
 
-def generate_drift_batch(n=BATCH_N, base=165.0, sigma=DRIFT_SIGMA):
-    """변동성을 3배 키운 드리프트 입력 (의도적으로 오차 유발)."""
-    return _random_walk(n, base, sigma)
+def wait_retrain(url: str, timeout: float) -> dict:
+    """/retrain/status 가 running 을 벗어날 때까지 폴링. 시간 안에 안 끝나면 마지막 상태를 돌려준다."""
+    endpoint = f"{url.rstrip('/')}/retrain/status"
+    deadline = time.monotonic() + timeout
+    status: dict = {}
+    while time.monotonic() < deadline:
+        status = requests.get(endpoint, timeout=REQUEST_TIMEOUT).json()
+        if status.get("state") != "running":
+            return status
+        print(f"  ... 재학습 진행 중 (시작 {status.get('started_at')})")
+        time.sleep(POLL_INTERVAL)
+    print(f"[시간 초과] {timeout:.0f}초 안에 재학습이 끝나지 않았습니다.")
+    return status
 
 
-def send_batch(prices: np.ndarray, label: str) -> dict:
-    # TODO(Day3): 생성한 배치를 /predict/batch-test 엔드포인트에 순차(또는 일괄) 요청으로 전송하세요.
-    # 힌트:
-    # resp = requests.post(API_URL, json={"prices": prices.tolist()})
-    # resp.raise_for_status()
-    # result = resp.json()
-    # print(f"[{label}] drift_check = {result['drift_check']}")
-    # return result
-    raise NotImplementedError("send_batch를 구현하세요 (실습 4-2)")
+def main(argv: list[str] | None = None) -> dict:
+    if hasattr(sys.stdout, "reconfigure"):  # 한국어 Windows 에서 파이프·리디렉션이면 stdout 이 cp949 — 못 찍는 문자(—)는 ? 로
+        sys.stdout.reconfigure(errors="replace")
+    parser = argparse.ArgumentParser(description="업무 규칙 시나리오 배치를 /predict/batch-test 로 보낸다")
+    parser.add_argument("--scenario", choices=list(SCENARIOS), default="normal",
+                        help="시나리오 이름 (기본 normal)")
+    parser.add_argument("--seed", type=int, default=0, help="test 구간 안 시작점을 고르는 시드 (기본 0)")
+    parser.add_argument("--url", default=DEFAULT_URL, help=f"서버 주소 (기본 {DEFAULT_URL})")
+    parser.add_argument("--n_targets", type=int, default=96,
+                        help=f"예측 대상 칸 수 (기본 96 = 하루). {DRIFT_WINDOW} 이상")
+    parser.add_argument("--wait", action="store_true",
+                        help="재학습이 시작되면 /retrain/status 가 끝날 때까지 기다린다")
+    parser.add_argument("--timeout", type=float, default=600, help="--wait 최대 대기 초 (기본 600)")
+    args = parser.parse_args(argv)
 
+    if args.n_targets < DRIFT_WINDOW:
+        parser.error(f"--n_targets 는 {DRIFT_WINDOW} 이상이어야 합니다 "
+                     f"(batch-test 최소 {SEQ_LEN + DRIFT_WINDOW}행 = SEQ_LEN {SEQ_LEN} + DRIFT_WINDOW {DRIFT_WINDOW})")
 
-def main():
-    mean, std = compute_baseline_stats()
-    print(f"[1] 기준 통계: mean={mean:.2f}, std={std:.2f}")
+    print(f"[1] 시나리오 {args.scenario} — {SCENARIOS[args.scenario]}")
+    rows = make_batch(args.scenario, n_targets=args.n_targets, seed=args.seed)
+    print(f"[2] 배치 {len(rows)}행 (맥락 {SEQ_LEN} + 대상 {args.n_targets}) · "
+          f"{rows[0]['timestamp']} ~ {rows[-1]['timestamp']} · seed={args.seed}")
 
-    print("[2] 정상 입력 테스트 전송...")
-    normal_batch = generate_normal_batch(base=mean)
-    send_batch(normal_batch, label="normal")
+    print(f"[3] 전송 → POST {args.url.rstrip('/')}/predict/batch-test")
+    result = send_batch(rows, args.url)
 
-    print("[3-4] 드리프트 입력 생성·주입...")
-    drift_batch = generate_drift_batch(base=mean)
-    send_batch(drift_batch, label="drift_injection")
+    predictions = result.get("predictions", [])
+    rmse_all = batch_rmse(predictions)
+    rmse_txt = f"{rmse_all:.2f}" if rmse_all is not None else "-"
+    print(f"[4] 예측 {len(predictions)}건 · 배치 전체 RMSE {rmse_txt} "
+          f"(참고값 — 판정은 서버의 최근 {DRIFT_WINDOW}건, 임계 {DRIFT_THRESHOLD})")
+    drift_check = result.get("drift_check", {})
+    print("[5] drift_check = " + json.dumps(drift_check, ensure_ascii=False))
 
-    print("[5] 결과 확인: requests.log 또는 서버 콘솔에서 [WARN] drift detected 로그를 확인하세요.")
+    state = drift_check.get("status")
+    if state == "ok":
+        print("    → 정상 범위. 재학습 없음.")
+    elif state == "retrain_triggered":
+        print("    → 드리프트 감지. 백그라운드 재학습이 시작됐습니다 (응답은 재학습을 기다리지 않음).")
+        print(f"      진행 상황: GET {args.url.rstrip('/')}/retrain/status · 로그: logs/aiops.log")
+        if args.wait:
+            final = wait_retrain(args.url, args.timeout)
+            print("[6] retrain/status = " + json.dumps(final, ensure_ascii=False, default=str))
+    elif state == "retrain_running":
+        print("    → 드리프트지만 이미 재학습이 진행 중이라 새로 시작하지 않았습니다.")
+    else:
+        print("    → 판단 보류 (윈도우가 아직 덜 찼거나 알 수 없는 상태).")
+    return result
 
 
 if __name__ == "__main__":

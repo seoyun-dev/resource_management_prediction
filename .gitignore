@@ -10,3 +10,6 @@ serving_app/models/*.pkl
 .pytest_cache/
 # KAMP 원본 데이터 — 공개 저장소 재배포 가능 여부 미확인이라 커밋하지 않는다
 data/seed/*.csv
+# 가이드북 등 PDF — 개인 ID 가 들어 있어 커밋하지 않는다 (SPEC §8)
+*.pdf
+.DS_Store

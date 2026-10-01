@@ -8,3 +8,5 @@ serving_app/models/*.pkl
 **/__pycache__/
 .pytest_cache/
 .git/
+**/*.pdf
+**/.DS_Store

@@ -1,14 +1,27 @@
-# Day2: FastAPI 서빙 앱 컨테이너 (단일 서비스)
+# 표면처리 에너지 지표 15분 예측 서빙 — 단일 서비스 (스켈레톤 구조 그대로)
 #
-# MLflow는 별도 서버 없이 이 컨테이너 안에서 로컬 sqlite로 트래킹합니다(Dockerfile 참고).
-# 이미지 빌드 시점에 샘플 데이터 시드 -> 베이스라인 학습 -> MLflow 등록까지 전부 끝나 있으므로,
-# 별도 초기화 단계나 기동 순서 없이 한 번에 띄우면 됩니다.
+# MLflow 는 별도 서버 없이 이 컨테이너 안에서 로컬 sqlite 로 트래킹한다(Dockerfile 참고).
+# 이미지 빌드 시점에 seed CSV 업로드 → baseline → MLflow 학습·등록(champion)까지 끝나 있으므로
+# 별도 초기화 단계나 기동 순서 없이 한 번에 띄우면 된다.
 #
+#   (프로젝트 루트에서, data/seed/Resource_Management_Process.csv 를 넣어 둔 뒤)
 #   docker compose -f serving_app/docker-compose.yml up --build
+#   → http://localhost:8000/ 대시보드 · http://localhost:8000/docs Swagger
 #
+# 주의: 재학습으로 승격된 버전은 컨테이너 안 mlflow.db 에만 있다. 컨테이너를 지우면(down) 빌드 때의
+#       champion 으로 돌아간다. 발표·증빙용 이력은 컨테이너를 지우기 전에 /registry/versions 로 남길 것.
 services:
   serving-app:
     build:
       context: ..
       dockerfile: serving_app/Dockerfile
+    image: surface-power-serving:latest
     ports: ["8000:8000"]
+    healthcheck:
+      # slim 이미지에 curl 이 없어 파이썬 표준 라이브러리로 /health 를 친다.
+      # 200 만 보지 않고 status 를 읽는다 — Eager 로드가 실패해 /predict 가 전부 503 인 컨테이너는 "degraded"
+      test: ["CMD", "python", "-c", "import json, sys, urllib.request; d = json.load(urllib.request.urlopen('http://localhost:8000/health', timeout=5)); sys.exit(0 if d.get('status') == 'ok' else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
