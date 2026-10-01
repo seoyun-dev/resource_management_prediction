@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+mlflow.db
+mlruns/
+logs/
+data/uploads/*.csv
+serving_app/models/*.keras
+serving_app/models/*.pkl
+.pytest_cache/
+# KAMP 원본 데이터 — 공개 저장소 재배포 가능 여부 미확인이라 커밋하지 않는다
+data/seed/*.csv

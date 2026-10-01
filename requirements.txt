@@ -1,0 +1,13 @@
+# 수업 스켈레톤과 같은 버전 + 팀 프로젝트에서 추가한 것(pandas·scikit-learn·pytest·httpx)
+fastapi==0.141.1
+uvicorn[standard]==0.46.0
+pydantic==2.13.3
+numpy==2.4.4
+tensorflow==2.21.0
+mlflow==3.16.0
+requests==2.33.1
+python-multipart==0.0.20
+pandas==3.0.5
+scikit-learn==1.9.0
+pytest
+httpx

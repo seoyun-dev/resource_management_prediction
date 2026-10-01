@@ -1,0 +1,10 @@
+.venv/
+mlflow.db
+mlruns/
+logs/
+data/uploads/*.csv
+serving_app/models/*.keras
+serving_app/models/*.pkl
+**/__pycache__/
+.pytest_cache/
+.git/
