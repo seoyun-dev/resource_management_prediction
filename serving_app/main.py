@@ -68,7 +68,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="표면처리 설비 전력 지표 예측 · AIOps",
+    title="부식방지 도금공장 15분 전력 예보 · AIOps",
     description="전기아연도금 설비 Power_Usage 다음 15분 예측(LSTM) + 드리프트 감지 + 자동 fine-tune",
     lifespan=lifespan,
 )

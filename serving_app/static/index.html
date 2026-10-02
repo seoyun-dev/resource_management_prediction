@@ -27,7 +27,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>AIOps · 표면처리 에너지 예측</title>
+<title>부식방지 도금공장 · 15분 전력 예보</title>
 <link rel="icon" type="image/x-icon" href="/favicon.ico" />
 <style>
   /* 스켈레톤의 다크 테마 토큰을 그대로 쓰고, 차트 계열색만 더했다.
@@ -344,8 +344,8 @@
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" stroke="#0a0c10" stroke-width="2" stroke-linejoin="round"/></svg>
     </div>
     <div class="brand-text">
-      <div class="title">AIOps · 표면처리 에너지 예측</div>
-      <div class="subtitle">전기아연도금 · 다음 15분 Power_Usage 예측</div>
+      <div class="title">부식방지 도금공장 · 15분 전력 예보</div>
+      <div class="subtitle">아연도금 라인 에너지 담당자용 · 다음 15분 Power_Usage 예측 · AIOps</div>
     </div>
   </div>
   <nav class="tabs" role="tablist" aria-label="화면 전환">
@@ -587,7 +587,7 @@
 
 </main>
 
-<footer>표면처리 에너지 예측 AIOps · SKALA 모델 서빙 팀 프로젝트 (serving_app/static/index.html)</footer>
+<footer>부식방지 도금공장 15분 전력 예보 · SKALA 모델 서빙 팀 프로젝트 (serving_app/static/index.html)</footer>
 
 <script>
 "use strict";
@@ -829,7 +829,7 @@ function showTab() {
   const t = currentTab();
   $$("[data-panel]").forEach((el) => { el.hidden = el.dataset.panel !== t; });
   $$(".tab").forEach((el) => el.setAttribute("aria-selected", String(el.dataset.tab === t)));
-  document.title = `AIOps · 표면처리 에너지 예측 — ${t.charAt(0).toUpperCase() + t.slice(1)}`;
+  document.title = `부식방지 도금공장 전력 예보 — ${t.charAt(0).toUpperCase() + t.slice(1)}`;
   if (t === "simulation") renderSimCharts();   // 숨겨진 탭에서는 폭을 잴 수 없어 보일 때 다시 그린다
 }
 
